@@ -44,6 +44,8 @@ pub struct LsmStorageState {
     /// The current memtable.
     pub memtable: Arc<MemTable>,
     /// Immutable memtables, from latest to earliest.
+    /// Me: I pushed the lastest frozon memtable at the tail so the greater
+    /// the index, the later the memtable.
     pub imm_memtables: Vec<Arc<MemTable>>,
     /// L0 SSTs, from latest to earliest.
     pub l0_sstables: Vec<usize>,
@@ -298,13 +300,21 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let value = self
-            .state
-            .read()
-            .memtable
-            .get(&Bytes::copy_from_slice(_key));
-        // Deletion is implemented by putting an empty Bytes to the key.
-        Ok(value.and_then(|x| if x.len() == 0 { None } else { Some(x) }))
+        let engine = self.state.read();
+
+        let key = &Bytes::copy_from_slice(_key);
+        let value = engine.memtable.get(key);
+        if value.is_some() {
+            return Ok(value);
+        }
+
+        for memtable in engine.imm_memtables.iter() {
+            let vaue = memtable.get(key);
+            if value.is_some() {
+                return Ok(value);
+            }
+        }
+        Ok(None)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -326,8 +336,11 @@ impl LsmStorageInner {
 
         let size = engine.memtable.approximate_size();
         if engine.memtable.approximate_size() > self.options.target_sst_size {
-            drop(engine);
-            self.force_freeze_memtable(&self.state_lock.lock())?;
+            let state_lock = &self.state_lock.lock();
+            if engine.memtable.approximate_size() > self.options.target_sst_size {
+                drop(engine);
+                self.force_freeze_memtable(state_lock)?;
+            }
         }
 
         return Ok(());
@@ -362,12 +375,11 @@ impl LsmStorageInner {
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let mut engine = self.state.write();
-        if engine.memtable.approximate_size() < self.options.target_sst_size {
-            return Ok(());
-        }
 
         let mut new_engine = (**engine).clone();
-        new_engine.imm_memtables.push(Arc::clone(&engine.memtable));
+        new_engine
+            .imm_memtables
+            .insert(0, Arc::clone(&engine.memtable));
         new_engine.memtable = Arc::new(MemTable::create(self.next_sst_id()));
 
         *engine = Arc::new(new_engine);
