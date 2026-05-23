@@ -304,16 +304,25 @@ impl LsmStorageInner {
 
         let key = &Bytes::copy_from_slice(_key);
         let value = engine.memtable.get(key);
-        if value.is_some() {
-            return Ok(value);
-        }
-
-        for memtable in engine.imm_memtables.iter() {
-            let vaue = memtable.get(key);
-            if value.is_some() {
+        if let Some(v) = &value {
+            if v.is_empty() {
+                return Ok(None);
+            } else {
                 return Ok(value);
             }
         }
+
+        for imm_memtable in engine.imm_memtables.iter() {
+            let value = imm_memtable.get(key);
+            if let Some(v) = &value {
+                if v.is_empty() {
+                    return Ok(None);
+                } else {
+                    return Ok(value);
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -343,13 +352,12 @@ impl LsmStorageInner {
             }
         }
 
-        return Ok(());
+        Ok(())
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        let result = self.put(_key, &[]);
-        result
+        self.put(_key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {

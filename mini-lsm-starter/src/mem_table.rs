@@ -94,8 +94,6 @@ impl MemTable {
     pub fn get(&self, _key: &[u8]) -> Option<Bytes> {
         self.map
             .get(&Bytes::copy_from_slice(_key))
-            // Deletion is implemented by putting an empty Bytes to the key.
-            .filter(|x| x.value().len() > 0)
             .map(|x| x.value().clone())
     }
 
