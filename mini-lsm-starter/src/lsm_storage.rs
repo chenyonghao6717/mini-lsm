@@ -340,14 +340,20 @@ impl LsmStorageInner {
         // By using CoW, the writer trying to freeze memtable doesn't need to wait
         // readers to finish because it copies a new one. The write lock only blocks
         // later readers and writer from seeing a mid-state engine.
-        let engine = self.state.read();
-        engine.memtable.put(_key, _value)?;
+        let needs_freeze = {
+            let engine = self.state.read();
+            engine.memtable.put(_key, _value)?;
+            engine.memtable.approximate_size() > self.options.target_sst_size
+        };
 
-        let size = engine.memtable.approximate_size();
-        if engine.memtable.approximate_size() > self.options.target_sst_size {
+        if needs_freeze {
             let state_lock = &self.state_lock.lock();
-            if engine.memtable.approximate_size() > self.options.target_sst_size {
-                drop(engine);
+            let actual_needs_lock = {
+                let engine = self.state.read();
+                engine.memtable.approximate_size() > self.options.target_sst_size
+            };
+
+            if actual_needs_lock {
                 self.force_freeze_memtable(state_lock)?;
             }
         }
@@ -382,14 +388,15 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+        let new_engine = {
+            let engine = self.state.read();
+            let mut new_engine = (**engine).clone();
+            new_engine.imm_memtables.insert(0, new_engine.memtable);
+            new_engine.memtable = Arc::new(MemTable::create(self.next_sst_id()));
+            new_engine
+        };
+
         let mut engine = self.state.write();
-
-        let mut new_engine = (**engine).clone();
-        new_engine
-            .imm_memtables
-            .insert(0, Arc::clone(&engine.memtable));
-        new_engine.memtable = Arc::new(MemTable::create(self.next_sst_id()));
-
         *engine = Arc::new(new_engine);
 
         Ok(())
