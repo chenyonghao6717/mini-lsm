@@ -209,10 +209,12 @@ impl StorageIterator for MemTableIterator {
         KeySlice::from_slice(key)
     }
 
+    /// Returns whether there is still a valid value.
     fn is_valid(&self) -> bool {
         return !self.borrow_item().0.is_empty();
     }
 
+    /// Forwards cursor one step and put the new entry to item field.
     fn next(&mut self) -> Result<()> {
         let next_entry = self.with_iter_mut(|iter| to_iter_entry(iter.next()));
         self.with_item_mut(|item| *item = next_entry);
