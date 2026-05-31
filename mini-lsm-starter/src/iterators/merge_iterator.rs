@@ -17,6 +17,7 @@
 
 use std::cmp::{self};
 use std::collections::BinaryHeap;
+use std::collections::binary_heap::PeekMut;
 
 use anyhow::Result;
 
@@ -40,6 +41,8 @@ impl<I: StorageIterator> PartialOrd for HeapWrapper<I> {
     }
 }
 
+/// BinaryHeap of rust is a max-heap so the compare result needs to be reversed.
+///
 impl<I: StorageIterator> Ord for HeapWrapper<I> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         self.1
@@ -59,7 +62,19 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut heap = BinaryHeap::new();
+
+        for (idx, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                heap.push(HeapWrapper(idx, iter));
+            }
+        }
+
+        let top = heap.pop();
+        Self {
+            current: top,
+            iters: heap,
+        }
     }
 }
 
@@ -69,18 +84,61 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        if let Some(wrapper) = &self.current {
+            wrapper.1.key()
+        } else {
+            KeySlice::from_slice(&[])
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if let Some(wrapper) = &self.current {
+            wrapper.1.value()
+        } else {
+            &[]
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.is_some() && self.current.as_ref().unwrap().1.is_valid()
     }
 
+    /// In this function we do:
+    /// 1. advance current and all iterators have the same key of current
+    /// 2. drop all invalid iterators(that don't have more values)
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !self.is_valid() {
+            return Ok(());
+        }
+
+        let key = self.current.as_ref().unwrap().1.key();
+        let mut wrappers_to_next: Vec<HeapWrapper<I>> = Vec::new();
+
+        while let Some(wrapper) = self.iters.peek_mut() {
+            if !wrapper.1.is_valid() {
+                PeekMut::pop(wrapper);
+            } else if wrapper.1.key() == key {
+                wrappers_to_next.push(PeekMut::pop(wrapper));
+            } else {
+                break;
+            }
+        }
+
+        for mut wrapper in wrappers_to_next {
+            wrapper.1.next()?;
+            if wrapper.1.is_valid() {
+                self.iters.push(wrapper)
+            }
+        }
+
+        let mut current = self.current.take().unwrap();
+        current.1.next()?;
+        if current.1.is_valid() {
+            self.iters.push(current);
+        }
+
+        self.current = self.iters.pop();
+
+        Ok(())
     }
 }
