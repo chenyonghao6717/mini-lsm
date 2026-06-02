@@ -130,11 +130,7 @@ impl MemTable {
     pub fn scan(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> MemTableIterator {
         let mut iter = MemTableIterator::new(
             Arc::clone(&self.map),
-            |map_ref| {
-                let iter = map_ref.range((convert_bound(&_lower), convert_bound(&_upper)));
-                // let first_entry = to_iter_entry(iter.next());
-                iter
-            },
+            |map_ref| map_ref.range((convert_bound(&_lower), convert_bound(&_upper))),
             to_iter_entry(None),
         );
         // Call next() once to fill the first entry into item field.
@@ -211,7 +207,7 @@ impl StorageIterator for MemTableIterator {
 
     /// Returns whether there is still a valid value.
     fn is_valid(&self) -> bool {
-        return !self.borrow_item().0.is_empty();
+        !self.borrow_item().0.is_empty()
     }
 
     /// Forwards cursor one step and put the new entry to item field.
