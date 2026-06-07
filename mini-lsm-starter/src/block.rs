@@ -19,8 +19,18 @@ mod builder;
 mod iterator;
 
 pub use builder::BlockBuilder;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 pub use iterator::BlockIterator;
+use std::mem::size_of;
+
+// Sizes of fields in the block format:
+pub const KEY_LEN_BYTES: usize = size_of::<u16>();
+pub const VAL_LEN_BYTES: usize = size_of::<u16>();
+pub const OFFSET_BYTES: usize = size_of::<u16>();
+pub const NUM_OF_ELEMENTS_BYTES: usize = size_of::<u16>();
+
+// The encoded entry overhead (key len + val len):
+pub const ENTRY_OVERHEAD: usize = KEY_LEN_BYTES + VAL_LEN_BYTES;
 
 /// A block is the smallest unit of read and caching in LSM tree. It is a collection of sorted key-value pairs.
 pub struct Block {
@@ -32,11 +42,40 @@ impl Block {
     /// Encode the internal data to the data layout illustrated in the course
     /// Note: You may want to recheck if any of the expected field is missing from your output
     pub fn encode(&self) -> Bytes {
-        unimplemented!()
+        let num_of_elements = self.offsets.len() as u16;
+
+        let mut buf = BytesMut::with_capacity(
+            self.data.len() + self.offsets.len() * OFFSET_BYTES + NUM_OF_ELEMENTS_BYTES,
+        );
+
+        buf.put_slice(&self.data);
+        for offset in &self.offsets {
+            buf.put_u16_le(*offset);
+        }
+        buf.put_u16_le(num_of_elements);
+
+        buf.freeze()
     }
 
     /// Decode from the data layout, transform the input `data` to a single `Block`
     pub fn decode(data: &[u8]) -> Self {
-        unimplemented!()
+        let data_len = data.len();
+        let num_of_elements = u16::from_le_bytes([data[data_len - 2], data[data_len - 1]]) as usize;
+
+        let offset_len = num_of_elements * OFFSET_BYTES;
+        let first_offset_index = data_len - offset_len - NUM_OF_ELEMENTS_BYTES;
+        let offsets_raw = &data[first_offset_index..data_len - NUM_OF_ELEMENTS_BYTES];
+        let offsets: Vec<u16> = offsets_raw
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+
+        let entries_len = data_len - offset_len - NUM_OF_ELEMENTS_BYTES;
+        let entryies = data[0..entries_len].to_vec();
+
+        Self {
+            offsets,
+            data: entryies,
+        }
     }
 }
