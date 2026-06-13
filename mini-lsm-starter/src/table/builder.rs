@@ -49,7 +49,8 @@ impl SsTableBuilder {
             builder: BlockBuilder::new(block_size),
             first_key: Vec::new(),
             last_key: Vec::new(),
-            data: Vec::new(),
+            // Pre-allocate 256 MB to avoid expensive copies.
+            data: Vec::with_capacity(256 * 1024 * 1024),
             meta: vec![BlockMeta {
                 offset: 0,
                 first_key: KeyBytes::from_bytes(Bytes::new()),
