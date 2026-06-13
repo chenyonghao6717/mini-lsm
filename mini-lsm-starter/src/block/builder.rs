@@ -90,4 +90,42 @@ impl BlockBuilder {
             offsets: self.offsets,
         }
     }
+
+    pub fn get_size(&self) -> usize {
+        self.data.len() + self.offsets.len() * OFFSET_BYTES
+    }
+
+    pub fn get_key(&self, index: usize) -> Vec<u8> {
+        if index >= self.offsets.len() {
+            Vec::new()
+        } else {
+            let entry_start = self.offsets[index] as usize;
+            let entry_end = {
+                if index + 1 < self.offsets.len() {
+                    self.offsets[index + 1] as usize
+                } else {
+                    self.data.len()
+                }
+            };
+            let key_len =
+                u16::from_le_bytes([self.data[entry_start], self.data[entry_start + 1]]) as usize;
+            let key_start = entry_start + KEY_LEN_BYTES;
+            let key_end = key_start + key_len;
+            let mut key = Vec::new();
+            key.extend_from_slice(&self.data[key_start..key_end]);
+            key
+        }
+    }
+
+    pub fn get_first_key(&self) -> Vec<u8> {
+        self.get_key(0)
+    }
+
+    pub fn get_last_key(&self) -> Vec<u8> {
+        if self.offsets.is_empty() {
+            Vec::new()
+        } else {
+            self.get_key(self.offsets.len() - 1)
+        }
+    }
 }

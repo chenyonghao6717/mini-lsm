@@ -18,9 +18,14 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use bytes::Bytes;
 
 use super::SsTable;
-use crate::{block::BlockIterator, iterators::StorageIterator, key::KeySlice};
+use crate::{
+    block::BlockIterator,
+    iterators::StorageIterator,
+    key::{KeyBytes, KeySlice},
+};
 
 /// An iterator over the contents of an SSTable.
 pub struct SsTableIterator {
@@ -32,24 +37,67 @@ pub struct SsTableIterator {
 impl SsTableIterator {
     /// Create a new iterator and seek to the first key-value pair in the first data block.
     pub fn create_and_seek_to_first(table: Arc<SsTable>) -> Result<Self> {
-        unimplemented!()
+        let first_block = table.read_block_cached(0)?;
+        let iter = Self {
+            table,
+            blk_iter: BlockIterator::create_and_seek_to_first(first_block),
+            blk_idx: 0,
+        };
+        Ok(iter)
     }
 
     /// Seek to the first key-value pair in the first data block.
     pub fn seek_to_first(&mut self) -> Result<()> {
-        unimplemented!()
+        let first_block = self.table.read_block_cached(0)?;
+        self.blk_iter = BlockIterator::create_and_seek_to_first(first_block);
+        self.blk_idx = 0;
+        Ok(())
     }
 
     /// Create a new iterator and seek to the first key-value pair which >= `key`.
     pub fn create_and_seek_to_key(table: Arc<SsTable>, key: KeySlice) -> Result<Self> {
-        unimplemented!()
+        let first_block = table.read_block_cached(0)?;
+        let mut iter = Self {
+            table,
+            blk_iter: BlockIterator::create_and_seek_to_first(first_block),
+            blk_idx: 0,
+        };
+        iter.seek_to_key(key)?;
+        Ok(iter)
     }
 
     /// Seek to the first key-value pair which >= `key`.
     /// Note: You probably want to review the handout for detailed explanation when implementing
     /// this function.
     pub fn seek_to_key(&mut self, key: KeySlice) -> Result<()> {
-        unimplemented!()
+        // Find the block with index i that block[i].first_key <= key < block[i + 1].first_key
+        let mut l = 0;
+        let mut r = self.table.block_meta.len() - 1;
+
+        let key_str = KeyBytes::from_bytes(Bytes::copy_from_slice(key.raw_ref()));
+
+        while l < r {
+            let mid = (l + r) >> 1;
+
+            let meta = &self.table.block_meta[mid];
+            let start_key = &meta.first_key;
+            let end_key = &meta.last_key;
+
+            if key < start_key.as_key_slice() {
+                r = mid;
+            } else if end_key.as_key_slice() < key {
+                l = mid + 1;
+            } else {
+                l = mid;
+                r = mid;
+            }
+        }
+
+        let block = self.table.read_block_cached(l)?;
+        self.blk_iter = BlockIterator::create_and_seek_to_key(block, key);
+        self.blk_idx = l;
+
+        Ok(())
     }
 }
 
@@ -58,22 +106,33 @@ impl StorageIterator for SsTableIterator {
 
     /// Return the `key` that's held by the underlying block iterator.
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.blk_iter.key()
     }
 
     /// Return the `value` that's held by the underlying block iterator.
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.blk_iter.value()
     }
 
     /// Return whether the current block iterator is valid or not.
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.blk_iter.is_valid()
     }
 
     /// Move to the next `key` in the block.
     /// Note: You may want to check if the current block iterator is valid after the move.
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.blk_iter.next();
+        // If all data of the current block is consumed
+        if !self.blk_iter.is_valid() {
+            self.blk_idx += 1;
+            if self.blk_idx < self.table.block_meta.len() {
+                let next_block = self.table.read_block_cached(self.blk_idx)?;
+                let iter = BlockIterator::create_and_seek_to_first(next_block);
+                self.blk_iter = iter;
+            }
+        }
+
+        Ok(())
     }
 }
