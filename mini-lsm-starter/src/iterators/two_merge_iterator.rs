@@ -19,12 +19,18 @@ use anyhow::Result;
 
 use super::StorageIterator;
 
+enum CompareState {
+    ALess,
+    BLess,
+    Equal,
+}
+
 /// Merges two iterators of different types into one. If the two iterators have the same key, only
 /// produce the key once and prefer the entry from A.
 pub struct TwoMergeIterator<A: StorageIterator, B: StorageIterator> {
     a: A,
     b: B,
-    // Add fields as need
+    compare_state: CompareState,
 }
 
 impl<
@@ -32,8 +38,31 @@ impl<
     B: 'static + for<'a> StorageIterator<KeyType<'a> = A::KeyType<'a>>,
 > TwoMergeIterator<A, B>
 {
+    fn get_compare_state(a: &A, b: &B) -> CompareState {
+        if !a.is_valid() {
+            CompareState::BLess
+        } else if !b.is_valid() {
+            CompareState::ALess
+        } else {
+            let key_a = a.key();
+            let key_b = b.key();
+            if key_a == key_b {
+                CompareState::Equal
+            } else if key_a < key_b {
+                CompareState::ALess
+            } else {
+                CompareState::BLess
+            }
+        }
+    }
+
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        let compare_state = Self::get_compare_state(&a, &b);
+        Ok(Self {
+            a,
+            b,
+            compare_state,
+        })
     }
 }
 
@@ -45,18 +74,37 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        match &self.compare_state {
+            CompareState::ALess | CompareState::Equal => self.a.key(),
+            CompareState::BLess => self.b.key(),
+        }
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        match &self.compare_state {
+            CompareState::ALess | CompareState::Equal => self.a.value(),
+            CompareState::BLess => self.b.value(),
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.a.is_valid() || self.b.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        match self.compare_state {
+            CompareState::ALess => {
+                self.a.next()?;
+            }
+            CompareState::BLess => {
+                self.b.next()?;
+            }
+            CompareState::Equal => {
+                self.a.next()?;
+                self.b.next()?;
+            }
+        }
+        self.compare_state = Self::get_compare_state(&self.a, &self.b);
+        Ok(())
     }
 }
