@@ -57,6 +57,7 @@ impl<I: StorageIterator> Ord for HeapWrapper<I> {
 /// iterators, prefer the one with smaller index.
 pub struct MergeIterator<I: StorageIterator> {
     iters: BinaryHeap<HeapWrapper<I>>,
+    // current is popped from the heap
     current: Option<HeapWrapper<I>>,
 }
 
@@ -140,5 +141,10 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         self.current = self.iters.pop();
 
         Ok(())
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        // self.current is stored separated from self.iters
+        self.iters.len() + 1
     }
 }

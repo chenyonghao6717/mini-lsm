@@ -140,7 +140,11 @@ impl MemTable {
 
     /// Flush the mem-table to SSTable. Implement in week 1 day 6.
     pub fn flush(&self, _builder: &mut SsTableBuilder) -> Result<()> {
-        unimplemented!()
+        let iter = self.map.iter();
+        for entry in iter {
+            _builder.add(KeySlice::from_slice(entry.key()), entry.value())
+        }
+        Ok(())
     }
 
     pub fn id(&self) -> usize {

@@ -21,6 +21,7 @@ mod iterator;
 
 use std::fs::File;
 use std::io::Cursor;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -331,5 +332,42 @@ impl SsTable {
 
     pub fn max_ts(&self) -> u64 {
         self.max_ts
+    }
+
+    pub fn has_overlap(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> bool {
+        match _lower {
+            Bound::Included(lower_key) => {
+                if lower_key > self.last_key.as_key_slice().raw_ref() {
+                    return false;
+                }
+            }
+            Bound::Excluded(lower_key) => {
+                if lower_key >= self.last_key.as_key_slice().raw_ref() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+
+        match _upper {
+            Bound::Included(upper_key) => {
+                if upper_key < self.first_key.as_key_slice().raw_ref() {
+                    return false;
+                }
+            }
+            Bound::Excluded(upper_key) => {
+                if upper_key <= self.first_key.as_key_slice().raw_ref() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+
+        true
+    }
+
+    pub fn has_key(&self, key: &[u8]) -> bool {
+        self.first_key.as_key_slice().raw_ref() <= key
+            && key <= self.last_key.as_key_slice().raw_ref()
     }
 }

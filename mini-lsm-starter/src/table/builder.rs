@@ -124,7 +124,7 @@ impl SsTableBuilder {
     /// | block section | meta section |          extra          |
     /// |               |              |  meta block offset u32  |
     pub fn build(
-        #[allow(unused_mut)] mut self,
+        mut self,
         id: usize,
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,

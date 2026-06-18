@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -38,7 +38,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -48,8 +48,7 @@ pub struct LsmStorageState {
     /// The current memtable.
     pub memtable: Arc<MemTable>,
     /// Immutable memtables, from latest to earliest.
-    /// Me: I pushed the lastest frozon memtable at the tail so the greater
-    /// the index, the later the memtable.
+    /// A newly frozon memtable is inserted at index 0.
     pub imm_memtables: Vec<Arc<MemTable>>,
     /// L0 SSTs, from latest to earliest.
     pub l0_sstables: Vec<usize>,
@@ -175,7 +174,16 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.flush_notifier.send(()).map_err(|e| anyhow!("{}", e))?;
+
+        {
+            let mut flush_thread = self.flush_thread.lock();
+            if let Some(handle) = flush_thread.take() {
+                handle.join().map_err(|e| anyhow!("{:?}", e))?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -424,9 +432,65 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    fn get_earliest_imm_memtable(&self) -> Option<Arc<MemTable>> {
+        let guard = self.state.read();
+        guard.imm_memtables.last().cloned()
+    }
+
+    /// This method doesn't check any race conditions, they are checked
+    /// in self.force_flush_next_imm_memtable
+    pub fn flush_earliest_memtable(&self) -> Result<()> {
+        let mut new_engine = {
+            let engine = self.state.read();
+            (**engine).clone()
+        };
+        let memtable = new_engine.imm_memtables.last().unwrap();
+        let sst_id = new_engine.l0_sstables.len();
+
+        // Build SST (protected by self.state_lock)
+        let mut table_builder = SsTableBuilder::new(self.options.target_sst_size);
+        memtable.flush(&mut table_builder)?;
+        let sstable = table_builder.build(
+            new_engine.l0_sstables.len(),
+            Some(Arc::clone(&self.block_cache)),
+            self.path_of_sst(sst_id),
+        )?;
+
+        // Insert new sstable and remove memtable
+        new_engine.l0_sstables.insert(0, sst_id);
+        new_engine.sstables.insert(sst_id, Arc::new(sstable));
+        new_engine.imm_memtables.pop();
+
+        let mut engine = self.state.write();
+        *engine = Arc::new(new_engine);
+
+        Ok(())
+    }
+
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        // Double check lock.
+        let earliest_memtable = self.get_earliest_imm_memtable();
+        if earliest_memtable.is_none() {
+            return Ok(());
+        }
+
+        let _mutex = self.state_lock.lock();
+
+        let earliest_memtable_ = self.get_earliest_imm_memtable();
+        // If the above checked memtable is removed, do nothing
+        if earliest_memtable_.is_none()
+            || !Arc::ptr_eq(
+                earliest_memtable.as_ref().unwrap(),
+                earliest_memtable_.as_ref().unwrap(),
+            )
+        {
+            return Ok(());
+        }
+
+        self.flush_earliest_memtable()?;
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -453,12 +517,16 @@ impl LsmStorageInner {
     fn to_sst_merge_iter(
         engine: Arc<LsmStorageState>,
         _lower: Bound<&[u8]>,
+        _upper: Bound<&[u8]>,
     ) -> Result<MergeIterator<SsTableIterator>> {
         let mut sstable_iters: Vec<Box<SsTableIterator>> = engine
             .l0_sstables
             .iter()
             .filter_map(|id| {
                 let sstable = engine.sstables.get(id)?;
+                if !sstable.has_overlap(_lower, _upper) {
+                    return None;
+                }
                 SsTableIterator::create_and_seek_to_first(sstable.clone()).ok()
             })
             .map(Box::new)
@@ -499,7 +567,7 @@ impl LsmStorageInner {
         };
 
         let memtable_merge_iter = Self::to_memtable_merge_iter(snapshot.clone(), _lower, _upper);
-        let sst_merge_iter = Self::to_sst_merge_iter(snapshot, _lower)?;
+        let sst_merge_iter = Self::to_sst_merge_iter(snapshot, _lower, _upper)?;
 
         let iter = LsmIterator::new(
             TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?,
