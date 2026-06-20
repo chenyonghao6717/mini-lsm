@@ -15,10 +15,10 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::{collections::HashSet, fs::OpenOptions};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -28,6 +28,7 @@ use crate::{
     block::BlockBuilder,
     key::{Key, KeyBytes, KeySlice},
     lsm_storage::BlockCache,
+    table::bloom::Bloom,
 };
 
 pub const META_BLOCK_OFFSET_BYTES: u32 = 4;
@@ -40,6 +41,7 @@ pub struct SsTableBuilder {
     data: Vec<u8>,
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
+    key_hash_values: HashSet<u32>,
 }
 
 impl SsTableBuilder {
@@ -57,6 +59,7 @@ impl SsTableBuilder {
                 last_key: KeyBytes::from_bytes(Bytes::new()),
             }],
             block_size,
+            key_hash_values: HashSet::new(),
         }
     }
 
@@ -87,6 +90,9 @@ impl SsTableBuilder {
     /// Note: You should split a new block when the current block is full.(`std::mem::replace` may
     /// be helpful here)
     pub fn add(&mut self, key: KeySlice, value: &[u8]) {
+        self.key_hash_values
+            .insert(farmhash::fingerprint32(key.raw_ref()));
+
         if self.first_key.is_empty() {
             self.first_key = key.raw_ref().to_vec();
         }
@@ -120,9 +126,15 @@ impl SsTableBuilder {
             .to_vec();
     }
 
+    fn create_bloom(&self) -> Bloom {
+        let bits_per_key = 10;
+        let key_hash_values: &[u32] = &self.key_hash_values.iter().cloned().collect::<Vec<u32>>();
+        Bloom::build_from_key_hashes(key_hash_values, bits_per_key)
+    }
+
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
-    /// | block section | meta section |          extra          |
-    /// |               |              |  meta block offset u32  |
+    /// | block section |    meta section    |    bloom section     |
+    /// |               | meta | meta offset | bloom | bloom offset |
     pub fn build(
         mut self,
         id: usize,
@@ -143,12 +155,14 @@ impl SsTableBuilder {
         // Fill first_key and last_key
         self.fill_keys();
 
-        // Encode meta.
+        // Encode meta
         let mut meta_buf = Vec::<u8>::new();
         BlockMeta::encode_block_meta(&self.meta, &mut meta_buf);
 
-        // The beginning index of offset section.
-        let meta_section_offset = self.data.len();
+        // Encode bloom
+        let mut bloom_buf = Vec::<u8>::new();
+        let bloom = self.create_bloom();
+        bloom.encode(&mut bloom_buf);
 
         let mut file = OpenOptions::new()
             .create(true)
@@ -157,22 +171,32 @@ impl SsTableBuilder {
             .truncate(true)
             .open(path)?;
 
+        // Write key-value data
         file.write_all(self.data.as_ref())?;
+
+        // Write meta section
+        let meta_section_offset = file.metadata()?.len();
         file.write_all(meta_buf.as_ref())?;
         file.write_all(&u32::to_le_bytes(meta_section_offset as u32))?;
+
+        // Write bloom section
+        let bloom_offset = file.metadata()?.len();
+        file.write_all(bloom_buf.as_ref())?;
+        file.write_all(&u32::to_le_bytes(bloom_offset as u32))?;
         file.flush()?;
+
         let file_meta = file.metadata()?;
         let file_size = file_meta.len();
 
         Ok(SsTable {
             file: FileObject(Some(file), file_size),
             block_meta: self.meta,
-            block_meta_offset: meta_section_offset,
+            block_meta_offset: meta_section_offset as usize,
             id,
             block_cache,
             first_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.first_key)),
             last_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.last_key)),
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }

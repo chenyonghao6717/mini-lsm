@@ -341,11 +341,16 @@ impl LsmStorageInner {
         let key_slice = KeySlice::from_slice(_key);
         for index in engine.l0_sstables.iter() {
             if let Some(sst) = engine.sstables.get(index) {
-                if key < sst.first_key().raw_ref() || key > sst.last_key().raw_ref() {
+                if !sst.may_contain(key_slice.raw_ref()) {
                     continue;
                 }
                 let iter = SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
-                if iter.key() != key_slice || iter.value().is_empty() {
+                let k = iter.key();
+                let v = iter.value();
+                if iter.key() != key_slice {
+                    continue;
+                }
+                if iter.value().is_empty() {
                     return Ok(None);
                 } else {
                     return Ok(Some(Bytes::copy_from_slice(iter.value())));
@@ -378,12 +383,12 @@ impl LsmStorageInner {
 
         if needs_freeze {
             let state_lock = &self.state_lock.lock();
-            let actual_needs_lock = {
+            let actual_needs_freeze = {
                 let engine = self.state.read();
                 engine.memtable.approximate_size() > self.options.target_sst_size
             };
 
-            if actual_needs_lock {
+            if actual_needs_freeze {
                 self.force_freeze_memtable(state_lock)?;
             }
         }
@@ -448,7 +453,7 @@ impl LsmStorageInner {
         let sst_id = new_engine.l0_sstables.len();
 
         // Build SST (protected by self.state_lock)
-        let mut table_builder = SsTableBuilder::new(self.options.target_sst_size);
+        let mut table_builder = SsTableBuilder::new(self.options.block_size);
         memtable.flush(&mut table_builder)?;
         let sstable = table_builder.build(
             new_engine.l0_sstables.len(),

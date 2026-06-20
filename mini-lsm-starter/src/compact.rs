@@ -167,7 +167,7 @@ impl LsmStorageInner {
         };
 
         let mutable_memtable_num = 1;
-        if self.options.num_memtable_limit < snapshot.imm_memtables.len() + 1 {
+        if self.options.num_memtable_limit < snapshot.imm_memtables.len() + mutable_memtable_num {
             self.force_flush_next_imm_memtable()?;
         }
 

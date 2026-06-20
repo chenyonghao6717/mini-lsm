@@ -256,6 +256,7 @@ fn test_task3_storage_get() {
         snapshot.sstables.insert(sst1.sst_id(), sst1.into());
         *state = snapshot.into();
     }
+    storage.get(b"0").unwrap();
     assert_eq!(
         storage.get(b"0").unwrap(),
         Some(Bytes::from_static(b"2333333"))

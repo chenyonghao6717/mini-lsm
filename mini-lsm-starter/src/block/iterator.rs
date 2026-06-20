@@ -17,6 +17,7 @@ use std::sync::Arc;
 use crate::key::{KeySlice, KeyVec};
 
 use super::{Block, KEY_LEN_BYTES, VAL_LEN_BYTES};
+use crate::block::builder::BlockBuilder;
 
 /// Iterates on a block.
 pub struct BlockIterator {
@@ -33,16 +34,6 @@ pub struct BlockIterator {
 }
 
 impl BlockIterator {
-    fn new(block: Arc<Block>) -> Self {
-        Self {
-            block,
-            key: KeyVec::new(),
-            value_range: (0, 0),
-            idx: 0,
-            first_key: KeyVec::new(),
-        }
-    }
-
     /// An entry: |2 bytes length of key | key bytes | 2 bytes of length of value | value bytes |
     /// Returns a tuple of 4 numbers for the start(inclusive) and the end index(exclusive) of the key and value
     /// Returns 4 0 if the data has no entries after entry_start_index.
@@ -62,8 +53,54 @@ impl BlockIterator {
         Some((key_start, key_end, value_start, value_end))
     }
 
+    fn get_key(
+        data: &[u8],
+        key_start: usize,
+        key_end: usize,
+        index: usize,
+        // If the key to be gotton is already the first key, this arg can be any value.
+        first_key: &[u8],
+    ) -> Vec<u8> {
+        let encoded_key = &data[key_start..key_end];
+        if index == 0 {
+            // The first key is not encoded.
+            encoded_key.to_vec()
+        } else {
+            BlockBuilder::decode_key(encoded_key, first_key)
+        }
+    }
+
+    fn new(block: Arc<Block>) -> Self {
+        let first_entry_start = 0;
+        let first_entry_idx = 0;
+        if let Some((key_start, key_end, value_start, value_end)) =
+            Self::get_kv_range(&block.data, first_entry_start)
+        {
+            let first_key = Self::get_key(&block.data, key_start, key_end, first_entry_idx, &[]);
+            Self {
+                block,
+                key: KeyVec::from_vec(first_key.clone()),
+                value_range: (value_start, value_end),
+                idx: first_entry_idx,
+                first_key: KeyVec::from_vec(first_key),
+            }
+        } else {
+            Self {
+                block,
+                key: KeyVec::new(),
+                value_range: (0, 0),
+                idx: first_entry_idx,
+                first_key: KeyVec::new(),
+            }
+        }
+    }
+
     /// Returns key_start, key_end, value_start, value_end, index of the first key >= the given key
-    fn find_kv_range(block: &Block, key: KeySlice) -> Option<(usize, usize, usize, usize, usize)> {
+    fn find_kv_range(
+        block: &Block,
+        key: KeySlice,
+        first_key: &[u8],
+    ) -> Option<(usize, usize, usize, usize, usize)> {
         let mut l = 0;
         let mut r = block.offsets.len() - 1;
         while l < r {
@@ -72,8 +109,8 @@ impl BlockIterator {
             if let Some((key_start, key_end, value_start, value_end)) =
                 Self::get_kv_range(&block.data, offset as usize)
             {
-                let mid_key = KeyVec::from_vec(block.data[key_start..key_end].to_vec());
-                if key <= mid_key.as_key_slice() {
+                let mid_key = Self::get_key(&block.data, key_start, key_end, mid, first_key);
+                if key.raw_ref() <= mid_key.as_slice() {
                     r = mid;
                 } else {
                     l = mid + 1;
@@ -87,59 +124,28 @@ impl BlockIterator {
                 (key_start, key_end, value_start, value_end, l)
             },
         )
-
-        /*let mut index = 0;
-        let mut entry_start = 0;
-        while let Some((key_start, key_end, value_start, value_end)) =
-            Self::get_kv_range(&block.data, entry_start)
-        {
-            let cur_key = KeyVec::from_vec(block.data[key_start..key_end].to_vec());
-            if cur_key.as_key_slice() >= key {
-                return Some((key_start, key_end, value_start, value_end, index));
-            }
-            entry_start = value_end;
-            index += 1;
-        }
-        None
-        */
-    }
-
-    fn get_key(data: &[u8], key_start: usize, key_end: usize) -> KeyVec {
-        KeyVec::from_vec(data[key_start..key_end].to_vec())
     }
 
     /// Creates a block iterator and seek to the first entry.
     pub fn create_and_seek_to_first(block: Arc<Block>) -> Self {
-        let kv_range = Self::get_kv_range(&block.data, 0);
+        let first_entry_start = 0;
+        let first_entry_idx = 0;
+
+        let mut self_ = Self::new(Arc::clone(&block));
+
+        let kv_range = Self::get_kv_range(&block.data, first_entry_start);
         if let Some((key_start, key_end, value_start, value_end)) = kv_range {
-            let key = Self::get_key(&block.data, key_start, key_end);
-            Self {
-                block,
-                key: key.clone(),
-                value_range: (value_start, value_end),
-                idx: 0,
-                first_key: key,
-            }
-        } else {
-            Self::new(block)
+            let key = Self::get_key(&block.data, key_start, key_end, first_entry_idx, &[]);
+            self_.key = KeyVec::from_vec(key);
         }
+        self_
     }
 
     /// Creates a block iterator and seek to the first key that >= `key`.
     pub fn create_and_seek_to_key(block: Arc<Block>, key: KeySlice) -> Self {
-        let kv_range = Self::find_kv_range(&block, key);
-        if let Some((key_start, key_end, value_start, value_end, index_offset)) = kv_range {
-            let cur_key = Self::get_key(&block.data, key_start, key_end);
-            Self {
-                block,
-                key: cur_key.clone(),
-                value_range: (value_start, value_end),
-                idx: index_offset,
-                first_key: cur_key,
-            }
-        } else {
-            Self::new(block)
-        }
+        let mut self_ = Self::new(Arc::clone(&block));
+        self_.seek_to_key(key);
+        self_
     }
 
     /// Returns the key of the current entry.
@@ -165,8 +171,12 @@ impl BlockIterator {
 
     /// Seeks to the first key in the block.
     pub fn seek_to_first(&mut self) {
-        let (key_start, key_end, value_start, value_end, _) =
-            Self::find_kv_range(&self.block, self.first_key.as_key_slice()).unwrap();
+        let (key_start, key_end, value_start, value_end, _) = Self::find_kv_range(
+            &self.block,
+            self.first_key.as_key_slice(),
+            self.first_key.raw_ref(),
+        )
+        .unwrap();
         self.key = self.first_key.clone();
         self.value_range = (value_start, value_end);
         self.idx = 0;
@@ -176,12 +186,18 @@ impl BlockIterator {
     pub fn next(&mut self) {
         let next_kv_range = Self::get_kv_range(&self.block.data, self.value_range.1);
         if let Some((key_start, key_end, value_start, value_end)) = next_kv_range {
-            let next_key = KeyVec::from_vec(self.block.data[key_start..key_end].to_vec());
-            self.key = next_key;
+            let next_key = Self::get_key(
+                &self.block.data,
+                key_start,
+                key_end,
+                self.idx + 1,
+                self.first_key.raw_ref(),
+            );
+            self.key = KeyVec::from_vec(next_key);
             self.value_range = (value_start, value_end);
             self.idx += 1;
         } else {
-            self.key = KeyVec::from_vec(vec![]);
+            self.key = KeyVec::new()
         }
     }
 
@@ -190,10 +206,16 @@ impl BlockIterator {
     /// callers.
     pub fn seek_to_key(&mut self, key: KeySlice) {
         if let Some((key_start, key_end, value_start, value_end, index)) =
-            Self::find_kv_range(&self.block, key)
+            Self::find_kv_range(&self.block, key, self.first_key.raw_ref())
         {
-            let key = Self::get_key(&self.block.data, key_start, key_end);
-            self.key = key;
+            let key = Self::get_key(
+                &self.block.data,
+                key_start,
+                key_end,
+                index,
+                self.first_key.raw_ref(),
+            );
+            self.key = KeyVec::from_vec(key);
             self.value_range = (value_start, value_end);
             self.idx = index;
         } else {

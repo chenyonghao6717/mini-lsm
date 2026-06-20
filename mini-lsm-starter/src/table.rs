@@ -33,11 +33,13 @@ pub use iterator::SsTableIterator;
 use crate::block::Block;
 use crate::key::{KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
+use crate::table::builder::META_BLOCK_OFFSET_BYTES;
 
 use self::bloom::Bloom;
 use super::block::{NUM_OF_ELEMENTS_BYTES, OFFSET_BYTES};
 
 pub const BLOCK_META_OFFSET_BYTES: u64 = size_of::<u32>() as u64;
+pub const BLOOM_OFFSET_BYTES: u64 = size_of::<u32>() as u64;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -181,6 +183,20 @@ pub struct SsTable {
     max_ts: u64,
 }
 
+/// All ends are exclusive.
+struct SectionRange {
+    data_start: u64,
+    data_end: u64,
+    meta_start: u64,
+    meta_end: u64,
+    meta_offset_start: u64,
+    meta_offset_end: u64,
+    bloom_start: u64,
+    bloom_end: u64,
+    bloom_offset_start: u64,
+    bloom_offset_end: u64,
+}
+
 impl SsTable {
     #[cfg(test)]
     pub(crate) fn open_for_test(file: FileObject) -> Result<Self> {
@@ -201,32 +217,74 @@ impl SsTable {
         })
     }
 
-    /// Open SSTable from a file.
-    pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
+    fn to_u32(bytes: &[u8]) -> u32 {
+        u32::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+
+    /// See also SsTableBuilder::build
+    fn get_section_range(file: &FileObject) -> Result<Option<SectionRange>> {
         if file.0.is_none() {
-            return Self::new(id);
+            return Ok(None);
         }
 
         let file_size = file.size();
-        let block_meta_offset_bytes =
-            file.read(file_size - BLOCK_META_OFFSET_BYTES, BLOCK_META_OFFSET_BYTES)?;
 
-        if block_meta_offset_bytes.len() < BLOCK_META_OFFSET_BYTES as usize {
+        let bloom_offset_start = file_size - BLOOM_OFFSET_BYTES;
+        let bloom_offset_end = file_size;
+
+        let bloom_offset_bytes = file.read(bloom_offset_start, BLOCK_META_OFFSET_BYTES)?;
+        let bloom_offset = Self::to_u32(&bloom_offset_bytes);
+
+        let bloom_start = bloom_offset as u64;
+        let bloom_end = bloom_offset_start;
+
+        let meta_offset_start = bloom_start - META_BLOCK_OFFSET_BYTES as u64;
+        let meta_offset_end = bloom_start;
+
+        let meta_offset_bytes = file.read(meta_offset_start, META_BLOCK_OFFSET_BYTES as u64)?;
+        let meta_offset = Self::to_u32(&meta_offset_bytes);
+
+        let meta_start = meta_offset as u64;
+        let meta_end = meta_offset_start;
+
+        let data_start: u64 = 0;
+        let data_end = meta_start;
+
+        Ok(Some(SectionRange {
+            data_start,
+            data_end,
+            meta_start,
+            meta_end,
+            meta_offset_start,
+            meta_offset_end,
+            bloom_start,
+            bloom_end,
+            bloom_offset_start,
+            bloom_offset_end,
+        }))
+    }
+
+    /// Open SSTable from a file.
+    pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
+        let section_range = Self::get_section_range(&file)?;
+
+        if section_range.is_none() {
             return Self::new(id);
         }
-        let block_meta_offset = u32::from_le_bytes(
-            block_meta_offset_bytes[..BLOCK_META_OFFSET_BYTES as usize]
-                .try_into()
-                .unwrap(),
-        ) as u64;
 
-        let block_metas = if block_meta_offset > 0 {
-            let buf_len = file_size - block_meta_offset - BLOCK_META_OFFSET_BYTES;
-            let raw_meta = file.read(block_meta_offset, buf_len)?;
+        let section_range = section_range.unwrap();
+
+        let block_metas = {
+            let buf_len = section_range.meta_end - section_range.meta_start;
+            let raw_meta = file.read(section_range.meta_start, buf_len)?;
             BlockMeta::decode_block_meta(Cursor::new(raw_meta))
-        } else {
-            Vec::<BlockMeta>::new()
         };
+
+        let bloom = {
+            let buf_len = section_range.bloom_end - section_range.bloom_start;
+            let raw_bloom = file.read(section_range.bloom_start, buf_len)?;
+            Bloom::decode(&raw_bloom)
+        }?;
 
         let first_key = block_metas
             .first()
@@ -238,12 +296,12 @@ impl SsTable {
         Ok(Self {
             file,
             block_meta: block_metas,
-            block_meta_offset: block_meta_offset as usize,
+            block_meta_offset: section_range.meta_start as usize,
             id,
             block_cache,
             first_key,
             last_key,
-            bloom: None,
+            bloom: Some(bloom),
             max_ts: 0,
         })
     }
@@ -366,8 +424,11 @@ impl SsTable {
         true
     }
 
-    pub fn has_key(&self, key: &[u8]) -> bool {
-        self.first_key.as_key_slice().raw_ref() <= key
-            && key <= self.last_key.as_key_slice().raw_ref()
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        if let Some(bloom) = &self.bloom {
+            bloom.may_contain(farmhash::fingerprint32(key))
+        } else {
+            true
+        }
     }
 }

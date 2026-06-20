@@ -82,6 +82,17 @@ impl Bloom {
         locs as usize
     }
 
+    fn get_bit_positions(key_hash: u32, k: u32, nbits: usize, delta: u32) -> Vec<usize> {
+        let mut key_hash = key_hash;
+        let mut bit_positions = vec![];
+        for _ in 0..k {
+            let bit_pos = (key_hash as usize) % nbits;
+            bit_positions.push(bit_pos);
+            key_hash = key_hash.wrapping_add(delta);
+        }
+        bit_positions
+    }
+
     /// Build bloom filter from key hashes
     pub fn build_from_key_hashes(keys: &[u32], bits_per_key: usize) -> Self {
         let k = (bits_per_key as f64 * 0.69) as u32;
@@ -92,7 +103,15 @@ impl Bloom {
         let mut filter = BytesMut::with_capacity(nbytes);
         filter.resize(nbytes, 0);
 
-        // TODO: build the bloom filter
+        for key_hash in keys {
+            let delta = key_hash.rotate_left(15);
+            let bit_positions = Self::get_bit_positions(*key_hash, k, nbits, delta);
+            for bit_pos in bit_positions {
+                let byte_idx = bit_pos / 8;
+                let bit_idx = bit_pos % 8;
+                filter[byte_idx] |= 1 << bit_idx;
+            }
+        }
 
         Self {
             filter: filter.freeze(),
@@ -108,8 +127,16 @@ impl Bloom {
         } else {
             let nbits = self.filter.bit_len();
             let delta = h.rotate_left(15);
+            let bit_positions = Self::get_bit_positions(h, self.k as u32, nbits, delta);
 
-            // TODO: probe the bloom filter
+            for bit_pos in bit_positions {
+                let byte_idx = bit_pos / 8;
+                let bit_idx = bit_pos % 8;
+                let bit = (self.filter[byte_idx] >> bit_idx) % 2;
+                if bit == 0 {
+                    return false;
+                }
+            }
 
             true
         }

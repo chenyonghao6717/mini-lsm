@@ -14,7 +14,7 @@
 
 use bytes::BufMut;
 
-use crate::key::{Key, KeySlice, KeyVec};
+use crate::key::KeySlice;
 
 use super::{Block, KEY_LEN_BYTES, NUM_OF_ELEMENTS_BYTES, OFFSET_BYTES, VAL_LEN_BYTES};
 
@@ -27,7 +27,7 @@ pub struct BlockBuilder {
     /// The expected block size. Unit: byte
     block_size: usize,
     /// The first key in the block
-    first_key: KeyVec,
+    first_key: Vec<u8>,
 }
 
 impl BlockBuilder {
@@ -37,11 +37,11 @@ impl BlockBuilder {
             offsets: vec![],
             data: vec![],
             block_size,
-            first_key: Key::new(),
+            first_key: Vec::new(),
         }
     }
 
-    fn get_entry_size(key: KeySlice, value: &[u8]) -> usize {
+    fn get_entry_size(key: &[u8], value: &[u8]) -> usize {
         // Each k-v pair needs a u16 to store the key len, a u16 to store the value len.
         KEY_LEN_BYTES + VAL_LEN_BYTES + key.len() + value.len()
     }
@@ -53,7 +53,53 @@ impl BlockBuilder {
             + entry_size
             + OFFSET_BYTES;
 
+        println!(
+            "Block size check: total={}, block_size={}, data={}, offsets={}",
+            total_size_after_add,
+            self.block_size,
+            self.data.len(),
+            self.offsets.len()
+        );
+
         total_size_after_add > self.block_size
+    }
+
+    /// DO NOT encode the first key since we don't store the first key before encoded.
+    /// An encoded key looks like:
+    /// | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) |
+    fn encode_key(key: KeySlice, first_key: &[u8]) -> Vec<u8> {
+        let mut overlap_len: u16 = 0;
+        for (byte1, byte2) in key.raw_ref().iter().zip(first_key.iter()) {
+            if byte1 == byte2 {
+                overlap_len += 1;
+            } else {
+                break;
+            }
+        }
+
+        let rest_len = key.len() as u16 - overlap_len;
+        let mut encoded_key = Vec::<u8>::new();
+
+        // println!("{} {} {}", first_key.len(), overlap_len, rest_len);
+        // println!("{:?}", std::str::from_utf8(key.raw_ref()));
+
+        encoded_key.extend_from_slice(&overlap_len.to_le_bytes());
+        encoded_key.extend_from_slice(&rest_len.to_le_bytes());
+        encoded_key.extend_from_slice(&key.raw_ref()[overlap_len as usize..]);
+
+        encoded_key
+    }
+
+    /// See also Self::encode_key
+    pub fn decode_key(encoded_key: &[u8], first_key: &[u8]) -> Vec<u8> {
+        let overlap_len = u16::from_le_bytes([encoded_key[0], encoded_key[1]]);
+        let rest_len = u16::from_le_bytes([encoded_key[2], encoded_key[3]]);
+
+        let mut decoded_key = first_key[..overlap_len as usize].to_vec();
+        decoded_key.extend_from_slice(
+            &encoded_key[(size_of_val(&overlap_len) + size_of_val(&rest_len))..],
+        );
+        decoded_key
     }
 
     /// Adds a key-value pair to the block. Returns false when the block is full.
@@ -62,7 +108,15 @@ impl BlockBuilder {
     /// input data is larger than the threshold.
     #[must_use]
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
-        let entry_size = Self::get_entry_size(key, value);
+        // We don't encode the first key.
+        let encoded_key = if self.first_key.is_empty() {
+            self.first_key = key.raw_ref().to_vec();
+            key.raw_ref().to_vec()
+        } else {
+            Self::encode_key(key, &self.first_key)
+        };
+
+        let entry_size = Self::get_entry_size(&encoded_key, value);
         if !self.offsets.is_empty() && self.exceed_block_size(entry_size) {
             return false;
         }
@@ -70,8 +124,8 @@ impl BlockBuilder {
         let offset = self.data.len() as u16;
         self.offsets.push(offset);
 
-        self.data.put_u16_le(key.len() as u16);
-        self.data.put_slice(key.raw_ref());
+        self.data.put_u16_le(encoded_key.len() as u16);
+        self.data.put_slice(&encoded_key);
         self.data.put_u16_le(value.len() as u16);
         self.data.put_slice(value);
 
@@ -107,13 +161,19 @@ impl BlockBuilder {
                     self.data.len()
                 }
             };
+
             let key_len =
                 u16::from_le_bytes([self.data[entry_start], self.data[entry_start + 1]]) as usize;
             let key_start = entry_start + KEY_LEN_BYTES;
             let key_end = key_start + key_len;
-            let mut key = Vec::new();
-            key.extend_from_slice(&self.data[key_start..key_end]);
-            key
+            let encoded_key = self.data[key_start..key_end].to_vec();
+
+            // The first key is not encoded.
+            if index == 0 {
+                encoded_key
+            } else {
+                Self::decode_key(&encoded_key, &self.first_key)
+            }
         }
     }
 
