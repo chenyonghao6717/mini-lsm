@@ -107,8 +107,7 @@ impl SsTableBuilder {
     /// Since the data blocks contain much more data than meta blocks, just return the size of data
     /// blocks here.
     pub fn estimated_size(&self) -> usize {
-        // self.data.len() + self.builder.get_size()
-        self.data.len()
+        self.builder.get_size() + self.data.len()
     }
 
     fn fill_keys(&mut self) {

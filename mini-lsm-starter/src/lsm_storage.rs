@@ -31,6 +31,7 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::KeySlice;
@@ -310,9 +311,61 @@ impl LsmStorageInner {
         compaction_filters.push(compaction_filter);
     }
 
+    /// Find the value of a key in sstables denoted by sst_indices. We don't convert
+    /// a value with not data to Option::None here.
+    fn get_in_level(
+        &self,
+        engine: Arc<LsmStorageState>,
+        _key: &[u8],
+        sst_indices: &[usize],
+    ) -> Result<Option<Bytes>> {
+        for idx in sst_indices {
+            if let Some(sst) = engine.sstables.get(idx) {
+                if !sst.may_contain(_key) {
+                    continue;
+                }
+                let iter = SsTableIterator::create_and_seek_to_key(
+                    sst.clone(),
+                    KeySlice::from_slice(_key),
+                )?;
+                let k = iter.key();
+                let v = iter.value();
+                if iter.key().raw_ref() != _key {
+                    continue;
+                }
+                return Ok(Some(Bytes::copy_from_slice(iter.value())));
+            } else {
+                return Err(anyhow!("Sstable {} not found!", idx));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn get_in_sstables(&self, engine: Arc<LsmStorageState>, _key: &[u8]) -> Result<Option<Bytes>> {
+        let mut value: Option<Bytes> = None;
+        let value_of_l0 = self.get_in_level(Arc::clone(&engine), _key, &engine.l0_sstables)?;
+        if value_of_l0.is_some() {
+            value = value_of_l0;
+        } else {
+            for (level, sst_indices) in &engine.levels {
+                let value_of_level = self.get_in_level(Arc::clone(&engine), _key, sst_indices)?;
+                if value_of_level.is_some() {
+                    value = value_of_level;
+                    break;
+                }
+            }
+        }
+
+        Ok(value.filter(|v| !v.is_empty()))
+    }
+
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let engine = self.state.read();
+        let engine = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
 
         // Check the mutable memtable.
         let key = Bytes::copy_from_slice(_key);
@@ -337,28 +390,8 @@ impl LsmStorageInner {
             }
         }
 
-        // Check sstables in l0.
-        let key_slice = KeySlice::from_slice(_key);
-        for index in engine.l0_sstables.iter() {
-            if let Some(sst) = engine.sstables.get(index) {
-                if !sst.may_contain(key_slice.raw_ref()) {
-                    continue;
-                }
-                let iter = SsTableIterator::create_and_seek_to_key(sst.clone(), key_slice)?;
-                let k = iter.key();
-                let v = iter.value();
-                if iter.key() != key_slice {
-                    continue;
-                }
-                if iter.value().is_empty() {
-                    return Ok(None);
-                } else {
-                    return Ok(Some(Bytes::copy_from_slice(iter.value())));
-                }
-            }
-        }
-
-        Ok(None)
+        // Check sstables.
+        self.get_in_sstables(Arc::clone(&engine), key.as_ref())
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -426,7 +459,9 @@ impl LsmStorageInner {
         let new_engine = {
             let engine = self.state.read();
             let mut new_engine = (**engine).clone();
-            new_engine.imm_memtables.insert(0, new_engine.memtable);
+            new_engine
+                .imm_memtables
+                .insert(0, Arc::clone(&new_engine.memtable));
             new_engine.memtable = Arc::new(MemTable::create(self.next_sst_id()));
             new_engine
         };
@@ -450,13 +485,13 @@ impl LsmStorageInner {
             (**engine).clone()
         };
         let memtable = new_engine.imm_memtables.last().unwrap();
-        let sst_id = new_engine.l0_sstables.len();
+        let sst_id = self.next_sst_id();
 
         // Build SST (protected by self.state_lock)
         let mut table_builder = SsTableBuilder::new(self.options.block_size);
         memtable.flush(&mut table_builder)?;
         let sstable = table_builder.build(
-            new_engine.l0_sstables.len(),
+            sst_id,
             Some(Arc::clone(&self.block_cache)),
             self.path_of_sst(sst_id),
         )?;
@@ -519,23 +554,23 @@ impl LsmStorageInner {
         MergeIterator::create(memtable_iters)
     }
 
-    fn to_sst_merge_iter(
+    fn to_l0_sst_merge_iter(
         engine: Arc<LsmStorageState>,
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<MergeIterator<SsTableIterator>> {
-        let mut sstable_iters: Vec<Box<SsTableIterator>> = engine
-            .l0_sstables
-            .iter()
-            .filter_map(|id| {
-                let sstable = engine.sstables.get(id)?;
-                if !sstable.has_overlap(_lower, _upper) {
-                    return None;
+        let mut sstable_iters = Vec::<Box<SsTableIterator>>::new();
+        for idx in &engine.l0_sstables {
+            let table = engine.sstables.get(idx).map(Arc::clone);
+            if let Some(t) = table {
+                if t.has_overlap(_lower, _upper) {
+                    let iter = SsTableIterator::create_and_seek_to_first(t)?;
+                    sstable_iters.push(Box::new(iter));
                 }
-                SsTableIterator::create_and_seek_to_first(sstable.clone()).ok()
-            })
-            .map(Box::new)
-            .collect();
+            } else {
+                return Err(anyhow!("Sstable {} not found!", idx));
+            }
+        }
 
         match _lower {
             Bound::Included(key) => {
@@ -560,6 +595,52 @@ impl LsmStorageInner {
         Ok(MergeIterator::create(sstable_iters))
     }
 
+    fn to_concat_iter(
+        engine: Arc<LsmStorageState>,
+        sst_indices: &[usize],
+        _lower: Bound<&[u8]>,
+    ) -> Result<SstConcatIterator> {
+        let mut tables = Vec::<Arc<SsTable>>::new();
+        for idx in sst_indices {
+            let table = engine.sstables.get(idx).map(Arc::clone);
+            if let Some(t) = table {
+                tables.push(t)
+            } else {
+                return Err(anyhow!("Sstable {} not found!", idx));
+            }
+        }
+        match _lower {
+            Bound::Included(key) => {
+                SstConcatIterator::create_and_seek_to_key(tables, KeySlice::from_slice(key))
+            }
+            Bound::Excluded(key) => {
+                let mut iter =
+                    SstConcatIterator::create_and_seek_to_key(tables, KeySlice::from_slice(key))?;
+                if iter.is_valid() && iter.key().raw_ref() == key {
+                    iter.next()?;
+                }
+                Ok(iter)
+            }
+            _ => SstConcatIterator::create_and_seek_to_first(tables),
+        }
+    }
+
+    fn to_merge_concat_iter(
+        engine: Arc<LsmStorageState>,
+        _lower: Bound<&[u8]>,
+        _upper: Bound<&[u8]>,
+    ) -> Result<MergeIterator<SstConcatIterator>> {
+        let mut concat_iters = Vec::<Box<SstConcatIterator>>::new();
+        for (level, sst_indices) in &engine.levels {
+            concat_iters.push(Box::new(Self::to_concat_iter(
+                Arc::clone(&engine),
+                sst_indices,
+                _lower,
+            )?));
+        }
+        Ok(MergeIterator::create(concat_iters))
+    }
+
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
@@ -571,11 +652,17 @@ impl LsmStorageInner {
             Arc::clone(&guard)
         };
 
-        let memtable_merge_iter = Self::to_memtable_merge_iter(snapshot.clone(), _lower, _upper);
-        let sst_merge_iter = Self::to_sst_merge_iter(snapshot, _lower, _upper)?;
+        let memtable_merge_iter =
+            Self::to_memtable_merge_iter(Arc::clone(&snapshot), _lower, _upper);
+        // New sstables are pushed into l0 continuously so they may have overlaps. We still need to use MergeIterator for l0.
+        let l0_sst_merge_iter = Self::to_l0_sst_merge_iter(Arc::clone(&snapshot), _lower, _upper)?;
+        // Sstables in levels other than l0 don't have overlaps so SstConcatIterator can be applied here.
+        let merge_concat_iter = Self::to_merge_concat_iter(Arc::clone(&snapshot), _lower, _upper)?;
 
+        let memtable_and_l0_merge_iter =
+            TwoMergeIterator::create(memtable_merge_iter, l0_sst_merge_iter)?;
         let iter = LsmIterator::new(
-            TwoMergeIterator::create(memtable_merge_iter, sst_merge_iter)?,
+            TwoMergeIterator::create(memtable_and_l0_merge_iter, merge_concat_iter)?,
             _upper.map(Bytes::copy_from_slice),
         )?;
         Ok(FusedIterator::new(iter))

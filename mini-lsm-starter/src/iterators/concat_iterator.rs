@@ -34,12 +34,56 @@ pub struct SstConcatIterator {
 }
 
 impl SstConcatIterator {
+    fn search_table_idx(sstables: &[Arc<SsTable>], key: KeySlice) -> usize {
+        // An empty key means we start from the first table.
+        if key.is_empty() || sstables.is_empty() {
+            0
+        } else if key.raw_ref() > sstables.last().as_ref().unwrap().last_key().raw_ref() {
+            sstables.len() + 1
+        } else {
+            let mut l = 0;
+            let mut r = sstables.len() - 1;
+            while l < r {
+                let mid = l + (r - l) / 2;
+                let table = &sstables[mid];
+                if key.raw_ref() <= table.last_key().raw_ref() {
+                    r = mid;
+                } else {
+                    l = mid + 1;
+                }
+            }
+            l
+        }
+    }
+
     pub fn create_and_seek_to_first(sstables: Vec<Arc<SsTable>>) -> Result<Self> {
-        unimplemented!()
+        Ok(Self {
+            current: sstables
+                .first()
+                .map(|table| SsTableIterator::create_and_seek_to_first(Arc::clone(table)))
+                .transpose()?,
+            next_sst_idx: 1,
+            sstables,
+        })
     }
 
     pub fn create_and_seek_to_key(sstables: Vec<Arc<SsTable>>, key: KeySlice) -> Result<Self> {
-        unimplemented!()
+        let table_idx = Self::search_table_idx(&sstables, key);
+        let table = sstables.get(table_idx);
+        if let Some(t) = table {
+            let iter = SsTableIterator::create_and_seek_to_key(Arc::clone(t), key)?;
+            Ok(Self {
+                current: Some(iter),
+                next_sst_idx: table_idx + 1,
+                sstables,
+            })
+        } else {
+            Ok(Self {
+                current: None,
+                next_sst_idx: table_idx + 1,
+                sstables,
+            })
+        }
     }
 }
 
@@ -47,22 +91,36 @@ impl StorageIterator for SstConcatIterator {
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice<'_> {
-        unimplemented!()
+        self.current.as_ref().unwrap().key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().unwrap().value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.as_ref().is_some_and(|iter| iter.is_valid())
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if let Some(iter) = &mut self.current {
+            iter.next()?;
+            if !iter.is_valid() {
+                let next_iter = self
+                    .sstables
+                    .get(self.next_sst_idx)
+                    .map(|table| SsTableIterator::create_and_seek_to_first(Arc::clone(table)))
+                    .transpose()?;
+                self.current = next_iter;
+                self.next_sst_idx += 1;
+            }
+            Ok(())
+        } else {
+            Ok(())
+        }
     }
 
     fn num_active_iterators(&self) -> usize {
-        1
+        self.sstables.len()
     }
 }

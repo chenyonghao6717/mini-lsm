@@ -22,7 +22,7 @@ mod tiered;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
@@ -30,8 +30,11 @@ pub use simple_leveled::{
 };
 pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredCompactionTask};
 
+use crate::iterators::StorageIterator;
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CompactionTask {
@@ -123,12 +126,162 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
-        unimplemented!()
+    fn collect_sstables(
+        indices: &[usize],
+        snapshot: Arc<LsmStorageState>,
+    ) -> Result<Vec<Arc<SsTable>>> {
+        indices
+            .iter()
+            .map(|idx| {
+                snapshot
+                    .sstables
+                    .get(idx)
+                    .ok_or_else(|| anyhow!("Sstable of idx {} not found", idx))
+                    .map(Arc::clone)
+            })
+            .collect::<Result<Vec<_>>>()
     }
 
+    fn get_table_merge_iter(
+        indices: &[usize],
+        snapshot: Arc<LsmStorageState>,
+    ) -> Result<MergeIterator<SsTableIterator>> {
+        let sstable_iters = Self::collect_sstables(indices, Arc::clone(&snapshot))?
+            .iter()
+            .map(|table| SsTableIterator::create_and_seek_to_first(Arc::clone(table)).map(Box::new))
+            .collect::<Result<_>>()?;
+        Ok(MergeIterator::create(sstable_iters))
+    }
+
+    fn fully_compact(
+        &self,
+        _task: &CompactionTask,
+        snapshot: Arc<LsmStorageState>,
+    ) -> Result<Vec<Arc<SsTable>>> {
+        if let CompactionTask::ForceFullCompaction {
+            l0_sstables,
+            l1_sstables,
+        } = _task
+        {
+            let mut two_merge_iterator = TwoMergeIterator::create(
+                Self::get_table_merge_iter(l0_sstables, Arc::clone(&snapshot))?,
+                Self::get_table_merge_iter(l1_sstables, Arc::clone(&snapshot))?,
+            )?;
+            let mut new_tables = Vec::<Arc<SsTable>>::new();
+            let mut cur_builder = SsTableBuilder::new(self.options.block_size);
+
+            while two_merge_iterator.is_valid() {
+                if cur_builder.estimated_size() > self.options.target_sst_size {
+                    let id = self.next_sst_id();
+                    let new_table = cur_builder.build(
+                        id,
+                        Some(Arc::clone(&self.block_cache)),
+                        self.path_of_sst(id),
+                    )?;
+                    new_tables.push(Arc::new(new_table));
+                    cur_builder = SsTableBuilder::new(self.options.block_size);
+                }
+                // In week 2 day 1 we omit all deleted keys.
+                let value = two_merge_iterator.value();
+                if !value.is_empty() {
+                    cur_builder.add(two_merge_iterator.key(), two_merge_iterator.value());
+                }
+                two_merge_iterator.next()?;
+            }
+
+            if cur_builder.estimated_size() > 0 {
+                let id = self.next_sst_id();
+                let new_table = cur_builder.build(
+                    id,
+                    Some(Arc::clone(&self.block_cache)),
+                    self.path_of_sst(id),
+                )?;
+                new_tables.push(Arc::new(new_table));
+            }
+
+            Ok(new_tables)
+        } else {
+            Err(anyhow!(
+                "Passed a non-ForceFullCompaction task to LsmStroageInner::fully_compact!"
+            ))
+        }
+    }
+
+    fn compact(
+        &self,
+        _task: &CompactionTask,
+        snapshot: Arc<LsmStorageState>,
+    ) -> Result<Vec<Arc<SsTable>>> {
+        match _task {
+            CompactionTask::ForceFullCompaction { .. } => {
+                self.fully_compact(_task, Arc::clone(&snapshot))
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    /// Only called by one backgroud thread at any time so we don't need a mutex here.
+    /// In week 2 day 1 we focus on ForceFullCompaction.
     pub fn force_full_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
+        let task = CompactionTask::ForceFullCompaction {
+            l0_sstables: snapshot.l0_sstables.to_vec(),
+            l1_sstables: snapshot
+                .levels
+                .iter()
+                .find(|level| level.0 == 1)
+                .map(|level| level.1.to_vec())
+                // All LsmTrees are generated with level 1
+                .unwrap(),
+        };
+
+        // Replace with the new engine
+        let new_l1_tables = self.compact(&task, Arc::clone(&snapshot))?;
+        let state_lock = self.state_lock.lock();
+        let mut new_engine = {
+            let guard = self.state.read();
+            (**guard).clone()
+        };
+
+        // Drop old tables
+        for idx in &snapshot.l0_sstables {
+            new_engine.sstables.remove(idx);
+        }
+        let l1_sstables = snapshot
+            .levels
+            .iter()
+            .find(|level| level.0 == 1)
+            .map(|level| level.1.to_vec())
+            .unwrap();
+        for idx in l1_sstables {
+            new_engine.sstables.remove(&idx);
+        }
+
+        // Update table ids.
+        // During merging, new l0 tables might be added, them should be kept.
+        new_engine
+            .l0_sstables
+            .retain(|idx| !snapshot.l0_sstables.contains(idx));
+        new_engine.levels.retain(|level| level.0 != 1);
+        let l1_sstables = new_l1_tables
+            .iter()
+            .map(|table| table.sst_id())
+            .collect::<Vec<usize>>();
+        new_engine.levels.insert(0, (1, l1_sstables));
+
+        // Add new tables into the new engine.
+        for table in new_l1_tables {
+            new_engine.sstables.insert(table.sst_id(), table);
+        }
+
+        let mut guard = self.state.write();
+        *guard = Arc::new(new_engine);
+
+        Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {
