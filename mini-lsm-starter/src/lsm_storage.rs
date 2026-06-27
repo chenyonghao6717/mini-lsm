@@ -311,16 +311,16 @@ impl LsmStorageInner {
         compaction_filters.push(compaction_filter);
     }
 
-    /// Find the value of a key in sstables denoted by sst_indices. We don't convert
-    /// a value with not data to Option::None here.
+    /// Find the value of a key in sstables denoted by sst_ids. We don't convert
+    /// a value with empty data(tombstone) to Option::None here.
     fn get_in_level(
         &self,
-        engine: Arc<LsmStorageState>,
+        engine: &LsmStorageState,
         _key: &[u8],
-        sst_indices: &[usize],
+        sst_ids: &[usize],
     ) -> Result<Option<Bytes>> {
-        for idx in sst_indices {
-            if let Some(sst) = engine.sstables.get(idx) {
+        for id in sst_ids {
+            if let Some(sst) = engine.sstables.get(id) {
                 if !sst.may_contain(_key) {
                     continue;
                 }
@@ -335,21 +335,21 @@ impl LsmStorageInner {
                 }
                 return Ok(Some(Bytes::copy_from_slice(iter.value())));
             } else {
-                return Err(anyhow!("Sstable {} not found!", idx));
+                return Err(anyhow!("Sstable {} not found!", id));
             }
         }
 
         Ok(None)
     }
 
-    fn get_in_sstables(&self, engine: Arc<LsmStorageState>, _key: &[u8]) -> Result<Option<Bytes>> {
+    fn get_from_sstables(&self, engine: &LsmStorageState, _key: &[u8]) -> Result<Option<Bytes>> {
         let mut value: Option<Bytes> = None;
-        let value_of_l0 = self.get_in_level(Arc::clone(&engine), _key, &engine.l0_sstables)?;
+        let value_of_l0 = self.get_in_level(engine, _key, &engine.l0_sstables)?;
         if value_of_l0.is_some() {
             value = value_of_l0;
         } else {
-            for (level, sst_indices) in &engine.levels {
-                let value_of_level = self.get_in_level(Arc::clone(&engine), _key, sst_indices)?;
+            for (level, sst_ids) in &engine.levels {
+                let value_of_level = self.get_in_level(engine, _key, sst_ids)?;
                 if value_of_level.is_some() {
                     value = value_of_level;
                     break;
@@ -357,7 +357,7 @@ impl LsmStorageInner {
             }
         }
 
-        Ok(value.filter(|v| !v.is_empty()))
+        Ok(value)
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
@@ -391,7 +391,12 @@ impl LsmStorageInner {
         }
 
         // Check sstables.
-        self.get_in_sstables(Arc::clone(&engine), key.as_ref())
+        let value = self.get_from_sstables(&engine, key.as_ref())?;
+        if value.is_none() || value.as_ref().unwrap().is_empty() {
+            Ok(None)
+        } else {
+            Ok(value)
+        }
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.

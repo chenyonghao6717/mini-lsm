@@ -53,14 +53,6 @@ impl BlockBuilder {
             + entry_size
             + OFFSET_BYTES;
 
-        println!(
-            "Block size check: total={}, block_size={}, data={}, offsets={}",
-            total_size_after_add,
-            self.block_size,
-            self.data.len(),
-            self.offsets.len()
-        );
-
         total_size_after_add > self.block_size
     }
 

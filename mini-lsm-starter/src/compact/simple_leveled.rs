@@ -18,6 +18,7 @@ use crate::lsm_storage::LsmStorageState;
 
 #[derive(Debug, Clone)]
 pub struct SimpleLeveledCompactionOptions {
+    // 100 * (sst num of Ln+1) / (sst num of Ln)
     pub size_ratio_percent: usize,
     pub level0_file_num_compaction_trigger: usize,
     pub max_levels: usize,
@@ -49,7 +50,94 @@ impl SimpleLeveledCompactionController {
         &self,
         _snapshot: &LsmStorageState,
     ) -> Option<SimpleLeveledCompactionTask> {
-        unimplemented!()
+        if _snapshot.l0_sstables.len() >= self.options.level0_file_num_compaction_trigger {
+            let l1_id = 1;
+            return Some(SimpleLeveledCompactionTask {
+                upper_level: None,
+                upper_level_sst_ids: _snapshot.l0_sstables.clone(),
+                lower_level: l1_id,
+                lower_level_sst_ids: _snapshot.levels[l1_id - 1].1.clone(),
+                is_lower_level_bottom_level: false,
+            });
+        }
+
+        // From 1 to n
+        let max_level_id = _snapshot.levels.len();
+        for upper_level_id in 1..max_level_id {
+            let upper_level = &_snapshot.levels[upper_level_id - 1];
+
+            let lower_level_id = upper_level_id + 1;
+            let lower_level = &_snapshot.levels[lower_level_id - 1];
+            let is_lower_level_bottom_level = lower_level_id == max_level_id;
+
+            let upper_sst_num = upper_level.1.len();
+            let lower_sst_num = lower_level.1.len();
+
+            let need_compact = upper_sst_num > 0
+                && lower_sst_num * 100 / upper_sst_num < self.options.size_ratio_percent;
+
+            if need_compact {
+                return Some(SimpleLeveledCompactionTask {
+                    upper_level: Some(upper_level.0),
+                    upper_level_sst_ids: upper_level.1.clone(),
+                    lower_level: lower_level.0,
+                    lower_level_sst_ids: lower_level.1.clone(),
+                    is_lower_level_bottom_level,
+                });
+            }
+        }
+
+        None
+    }
+
+    pub fn apply_compaction_result_to_l0(
+        &self,
+        _snapshot: &LsmStorageState,
+        _task: &SimpleLeveledCompactionTask,
+        _output: &[usize],
+    ) -> (LsmStorageState, Vec<usize>) {
+        let mut new_engine = _snapshot.clone();
+        let mut consumed_sst_ids = Vec::<usize>::new();
+
+        // New sst will be flushed while compacting, we need to keep them.
+        let (consumed_l0_sst_ids, unconsumed_l0_sst_ids) = _snapshot
+            .l0_sstables
+            .iter()
+            .cloned()
+            .partition(|id| _task.upper_level_sst_ids.contains(id));
+
+        // Collect consumed sst ids.
+        consumed_sst_ids.extend(consumed_l0_sst_ids);
+        let l1_id = 1;
+        consumed_sst_ids.extend_from_slice(&_snapshot.levels[l1_id - 1].1);
+
+        // Apply new l0 and l1
+        new_engine.l0_sstables = unconsumed_l0_sst_ids;
+        let new_l1 = (l1_id, _output.to_vec());
+        new_engine.levels[l1_id - 1] = new_l1;
+
+        (new_engine, consumed_sst_ids)
+    }
+
+    pub fn apply_compaction_result_to_l1_and_lower(
+        &self,
+        _snapshot: &LsmStorageState,
+        _task: &SimpleLeveledCompactionTask,
+        _output: &[usize],
+    ) -> (LsmStorageState, Vec<usize>) {
+        let mut consumed_sst_ids = Vec::<usize>::new();
+        consumed_sst_ids.extend_from_slice(&_task.upper_level_sst_ids);
+        consumed_sst_ids.extend_from_slice(&_task.lower_level_sst_ids);
+
+        let upper_level_id = _task.upper_level.unwrap();
+        let new_upper_level = (upper_level_id, Vec::<usize>::new());
+        let new_lower_level = (_task.lower_level, _output.to_vec());
+
+        let mut new_engine = _snapshot.clone();
+        new_engine.levels[upper_level_id - 1] = new_upper_level;
+        new_engine.levels[_task.lower_level - 1] = new_lower_level;
+
+        (new_engine, consumed_sst_ids)
     }
 
     /// Apply the compaction result.
@@ -63,8 +151,12 @@ impl SimpleLeveledCompactionController {
         &self,
         _snapshot: &LsmStorageState,
         _task: &SimpleLeveledCompactionTask,
-        _output: &[usize],
+        _output: &[usize], // Sst ids after merge. They should be put in lower level.
     ) -> (LsmStorageState, Vec<usize>) {
-        unimplemented!()
+        if _task.upper_level.is_none() {
+            self.apply_compaction_result_to_l0(_snapshot, _task, _output)
+        } else {
+            self.apply_compaction_result_to_l1_and_lower(_snapshot, _task, _output)
+        }
     }
 }
