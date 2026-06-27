@@ -502,7 +502,12 @@ impl LsmStorageInner {
         )?;
 
         // Insert new sstable and remove memtable
-        new_engine.l0_sstables.insert(0, sst_id);
+        if self.compaction_controller.flush_to_l0() {
+            new_engine.l0_sstables.insert(0, sst_id);
+        } else {
+            // Tiered strategy doesn't use l0.
+            new_engine.levels.insert(0, (sst_id, vec![sst_id]));
+        }
         new_engine.sstables.insert(sst_id, Arc::new(sstable));
         new_engine.imm_memtables.pop();
 

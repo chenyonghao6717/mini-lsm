@@ -25,7 +25,9 @@ pub struct TieredCompactionTask {
 #[derive(Debug, Clone)]
 pub struct TieredCompactionOptions {
     pub num_tiers: usize,
+    // 100 * (num of sst of non-last tier) / (num of sst of last tier)
     pub max_size_amplification_percent: usize,
+    // The used raito is (100 + size_ratio) %, e.g., size_ratio = 1, used ratio is 101%.
     pub size_ratio: usize,
     pub min_merge_width: usize,
     pub max_merge_width: Option<usize>,
@@ -37,14 +39,93 @@ pub struct TieredCompactionController {
 
 impl TieredCompactionController {
     pub fn new(options: TieredCompactionOptions) -> Self {
+        println!("{:?}", options);
         Self { options }
+    }
+
+    // Merge all non-last tier sstabls with the last tier sstables.
+    fn generate_ampilification_compaction_task(
+        &self,
+        _snapshot: &LsmStorageState,
+    ) -> Option<TieredCompactionTask> {
+        let all_sst_num = _snapshot
+            .levels
+            .iter()
+            .map(|tier| tier.1.len())
+            .sum::<usize>();
+        let last_tier_sst_num = _snapshot.levels.last().as_ref().unwrap().1.len();
+        let non_last_iter_sst_num = all_sst_num - last_tier_sst_num;
+
+        let amplification_ratio_to_large = last_tier_sst_num == 0
+            || 100 * non_last_iter_sst_num / last_tier_sst_num
+                >= self.options.max_size_amplification_percent;
+        if amplification_ratio_to_large {
+            Some(TieredCompactionTask {
+                tiers: _snapshot.levels.clone(),
+                bottom_tier_included: true,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn generate_size_ratio_compaction_task(
+        &self,
+        _snapshot: &LsmStorageState,
+    ) -> Option<TieredCompactionTask> {
+        let mut previous_sstable_count = 0;
+        for (previous_tier_count, (tier_id, tier)) in _snapshot.levels.iter().enumerate() {
+            if previous_tier_count >= self.options.min_merge_width && previous_sstable_count > 0 {
+                let ratio = tier.len() * 100 / previous_sstable_count;
+                if ratio > (100 + self.options.size_ratio) {
+                    return Some(TieredCompactionTask {
+                        tiers: _snapshot.levels[..previous_tier_count].to_vec(),
+                        // Always false because only previous tiers of this tier are going to be merged.
+                        bottom_tier_included: false,
+                    });
+                }
+            }
+            previous_sstable_count += tier.len();
+        }
+        None
+    }
+
+    fn generate_reduce_tier_num_compaction_task(
+        &self,
+        _snapshot: &LsmStorageState,
+    ) -> Option<TieredCompactionTask> {
+        let tier_num = _snapshot.levels.len();
+        let num_tier = self.options.num_tiers;
+        if tier_num >= num_tier {
+            Some(TieredCompactionTask {
+                tiers: _snapshot.levels[..num_tier].to_vec(),
+                bottom_tier_included: tier_num == num_tier,
+            })
+        } else {
+            None
+        }
     }
 
     pub fn generate_compaction_task(
         &self,
         _snapshot: &LsmStorageState,
     ) -> Option<TieredCompactionTask> {
-        unimplemented!()
+        if _snapshot.levels.len() <= 1 || _snapshot.levels.len() < self.options.num_tiers {
+            return None;
+        }
+
+        let amplification_task = self.generate_ampilification_compaction_task(_snapshot);
+        if amplification_task.is_some() {
+            return amplification_task;
+        }
+
+        let size_ratio_task = self.generate_size_ratio_compaction_task(_snapshot);
+        if size_ratio_task.is_some() {
+            println!("size ratio compaction triggered");
+            return size_ratio_task;
+        }
+
+        self.generate_reduce_tier_num_compaction_task(_snapshot)
     }
 
     pub fn apply_compaction_result(
@@ -53,6 +134,19 @@ impl TieredCompactionController {
         _task: &TieredCompactionTask,
         _output: &[usize],
     ) -> (LsmStorageState, Vec<usize>) {
-        unimplemented!()
+        let sst_ids_to_remove = _task
+            .tiers
+            .iter()
+            .flat_map(|(_, tier)| tier.to_vec())
+            .collect::<Vec<usize>>();
+
+        let mut new_engine = _snapshot.clone();
+        let tier_num_to_remove = _task.tiers.len();
+        new_engine.levels = new_engine.levels[tier_num_to_remove..].to_vec();
+        let new_tier = (_output[0], _output.to_vec());
+        // Only tiers starting from the head of levels will be compacted. So the merged tier need also be put in the head.
+        new_engine.levels.insert(0, new_tier);
+
+        (new_engine, sst_ids_to_remove)
     }
 }

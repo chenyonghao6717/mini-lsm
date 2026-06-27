@@ -134,10 +134,10 @@ enum IteratorType {
 
 impl LsmStorageInner {
     fn collect_sstables(
-        indices: &[usize],
+        sst_ids: &[usize],
         snapshot: &LsmStorageState,
     ) -> Result<Vec<Arc<SsTable>>> {
-        indices
+        sst_ids
             .iter()
             .map(|idx| {
                 snapshot
@@ -160,7 +160,7 @@ impl LsmStorageInner {
         Ok(MergeIterator::create(sstable_iters))
     }
 
-    fn update_sstables(
+    fn update_engine_sstables(
         engine: &mut LsmStorageState,
         consumed_sst_ids: &[usize],
         new_sstables: Vec<Arc<SsTable>>,
@@ -171,6 +171,28 @@ impl LsmStorageInner {
         }
         for sstable in new_sstables {
             sstables.insert(sstable.sst_id(), sstable);
+        }
+    }
+
+    fn compact_tier(
+        &self,
+        task: &TieredCompactionTask,
+        snapshot: &LsmStorageState,
+    ) -> Result<Vec<Arc<SsTable>>> {
+        if let Some((last_tier, upper_tiers)) = task.tiers.split_last() {
+            let upper_tier_sst_ids = upper_tiers
+                .iter()
+                .flat_map(|(_, tier)| tier.to_vec())
+                .collect::<Vec<usize>>();
+            let last_tier_sst_ids = last_tier.1.to_vec();
+            self.compact_2_levels(
+                snapshot,
+                &upper_tier_sst_ids,
+                &last_tier_sst_ids,
+                task.bottom_tier_included,
+            )
+        } else {
+            Ok(Vec::new())
         }
     }
 
@@ -221,57 +243,22 @@ impl LsmStorageInner {
         Ok(new_tables)
     }
 
-    fn compact_simple(
-        &self,
-        _task: &SimpleLeveledCompactionTask,
-        snapshot: &LsmStorageState,
-    ) -> Result<Vec<Arc<SsTable>>> {
-        self.compact_2_levels(
-            snapshot,
-            &_task.upper_level_sst_ids,
-            &_task.lower_level_sst_ids,
-            _task.is_lower_level_bottom_level,
-        )
-    }
-
-    fn compact(
-        &self,
-        _task: &CompactionTask,
-        snapshot: &LsmStorageState,
-    ) -> Result<Vec<Arc<SsTable>>> {
-        match _task {
-            CompactionTask::ForceFullCompaction {
-                l0_sstables,
-                l1_sstables,
-            } => self.compact_2_levels(snapshot, l0_sstables, l1_sstables, true),
-
-            CompactionTask::Simple(task) => self.compact_simple(task, snapshot),
-
-            _ => unimplemented!(),
-        }
-    }
-
-    /// Only called by one backgroud thread at any time so we don't need a mutex here.
-    /// In week 2 day 1 we focus on ForceFullCompaction.
     pub fn force_full_compaction(&self) -> Result<()> {
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
 
-        let task = CompactionTask::ForceFullCompaction {
-            l0_sstables: snapshot.l0_sstables.to_vec(),
-            l1_sstables: snapshot
-                .levels
-                .iter()
-                .find(|level| level.0 == 1)
-                .map(|level| level.1.to_vec())
-                // All LsmTrees are generated with level 1
-                .unwrap(),
-        };
+        let l0_sst_ids = snapshot.l0_sstables.to_vec();
+        let l1_sst_ids = snapshot
+            .levels
+            .iter()
+            .find(|level| level.0 == 1)
+            .map(|level| level.1.to_vec())
+            .unwrap();
 
         // Replace with the new engine
-        let new_l1_tables = self.compact(&task, &snapshot)?;
+        let new_l1_tables = self.compact_2_levels(&snapshot, &l0_sst_ids, &l1_sst_ids, true)?;
         let state_lock = self.state_lock.lock();
         let mut new_engine = {
             let guard = self.state.read();
@@ -317,34 +304,65 @@ impl LsmStorageInner {
 
     fn trigger_simple_compaction(
         &self,
+        snapshot: &LsmStorageState,
         controller: SimpleLeveledCompactionController,
     ) -> Result<()> {
-        let _lock = self.state_lock.lock();
-
-        let snapshot = {
-            let guard = self.state.read();
-            Arc::clone(&guard)
-        };
-
-        let _task = controller.generate_compaction_task(&snapshot);
-        if let Some(task) = _task {
-            let compacted_sstabls = self.compact_simple(&task, &snapshot)?;
-            let compacted_sst_ids = compacted_sstabls
-                .iter()
-                .map(|sst| sst.sst_id())
-                .collect::<Vec<usize>>();
-
-            let (mut new_engine, consumed_sst_ids) =
-                controller.apply_compaction_result(&snapshot, &task, &compacted_sst_ids);
-            Self::update_sstables(&mut new_engine, &consumed_sst_ids, compacted_sstabls);
-
-            let mut guard = self.state.write();
-            *guard = Arc::new(new_engine);
+        let _task = controller.generate_compaction_task(snapshot);
+        if _task.is_none() {
+            return Ok(());
         }
+
+        let task = _task.unwrap();
+        let compacted_sstabls = self.compact_2_levels(
+            snapshot,
+            &task.upper_level_sst_ids,
+            &task.lower_level_sst_ids,
+            task.is_lower_level_bottom_level,
+        )?;
+        let compacted_sst_ids = compacted_sstabls
+            .iter()
+            .map(|sst| sst.sst_id())
+            .collect::<Vec<usize>>();
+
+        let (mut new_engine, consumed_sst_ids) =
+            controller.apply_compaction_result(snapshot, &task, &compacted_sst_ids);
+        Self::update_engine_sstables(&mut new_engine, &consumed_sst_ids, compacted_sstabls);
+
+        let mut guard = self.state.write();
+        *guard = Arc::new(new_engine);
+
+        Ok(())
+    }
+
+    fn trigger_tier_compaction(
+        &self,
+        snapshot: &LsmStorageState,
+        controller: TieredCompactionController,
+    ) -> Result<()> {
+        let _task = controller.generate_compaction_task(snapshot);
+        if _task.is_none() {
+            return Ok(());
+        }
+
+        let task = _task.unwrap();
+        let compacted_sstables = self.compact_tier(&task, snapshot)?;
+        let compacted_sst_ids = compacted_sstables
+            .iter()
+            .map(|sst| sst.sst_id())
+            .collect::<Vec<usize>>();
+
+        let (mut new_engine, consumed_sst_ids) =
+            controller.apply_compaction_result(snapshot, &task, &compacted_sst_ids);
+        Self::update_engine_sstables(&mut new_engine, &consumed_sst_ids, compacted_sstables);
+
+        let mut guard = self.state.write();
+        *guard = Arc::new(new_engine);
+
         Ok(())
     }
 
     fn trigger_compaction(&self) -> Result<()> {
+        let _lock = self.state_lock.lock();
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
@@ -352,7 +370,11 @@ impl LsmStorageInner {
         match &self.options.compaction_options {
             CompactionOptions::Simple(options) => {
                 let controller = SimpleLeveledCompactionController::new(options.clone());
-                self.trigger_simple_compaction(controller)
+                self.trigger_simple_compaction(&snapshot, controller)
+            }
+            CompactionOptions::Tiered(options) => {
+                let controller = TieredCompactionController::new(options.clone());
+                self.trigger_tier_compaction(&snapshot, controller)
             }
             _ => unimplemented!(),
         }
