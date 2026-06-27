@@ -125,6 +125,13 @@ pub enum CompactionOptions {
     NoCompaction,
 }
 
+enum IteratorType {
+    // If some sstables have overlaps.
+    Merge,
+    // If all sstables are sorted and don't have overlaps.
+    Concat,
+}
+
 impl LsmStorageInner {
     fn collect_sstables(
         indices: &[usize],
@@ -143,10 +150,10 @@ impl LsmStorageInner {
     }
 
     fn get_table_merge_iter(
-        indices: &[usize],
+        sst_ids: &[usize],
         snapshot: &LsmStorageState,
     ) -> Result<MergeIterator<SsTableIterator>> {
-        let sstable_iters = Self::collect_sstables(indices, snapshot)?
+        let sstable_iters = Self::collect_sstables(sst_ids, snapshot)?
             .iter()
             .map(|table| SsTableIterator::create_and_seek_to_first(Arc::clone(table)).map(Box::new))
             .collect::<Result<_>>()?;
@@ -172,6 +179,7 @@ impl LsmStorageInner {
         snapshot: &LsmStorageState,
         upper_sst_ids: &[usize],
         lower_sst_ids: &[usize],
+        is_lower_level_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut two_merge_iterator = TwoMergeIterator::create(
             Self::get_table_merge_iter(upper_sst_ids, snapshot)?,
@@ -191,9 +199,9 @@ impl LsmStorageInner {
                 new_tables.push(Arc::new(new_table));
                 cur_builder = SsTableBuilder::new(self.options.block_size);
             }
-            // In week 2 day 1 we omit all deleted keys.
             let value = two_merge_iterator.value();
-            if !value.is_empty() {
+            // Remove empty values in the lowest layer.
+            if !is_lower_level_bottom_level || !value.is_empty() {
                 cur_builder.add(two_merge_iterator.key(), two_merge_iterator.value());
             }
             two_merge_iterator.next()?;
@@ -222,6 +230,7 @@ impl LsmStorageInner {
             snapshot,
             &_task.upper_level_sst_ids,
             &_task.lower_level_sst_ids,
+            _task.is_lower_level_bottom_level,
         )
     }
 
@@ -234,7 +243,7 @@ impl LsmStorageInner {
             CompactionTask::ForceFullCompaction {
                 l0_sstables,
                 l1_sstables,
-            } => self.compact_2_levels(snapshot, l0_sstables, l1_sstables),
+            } => self.compact_2_levels(snapshot, l0_sstables, l1_sstables, true),
 
             CompactionTask::Simple(task) => self.compact_simple(task, snapshot),
 
