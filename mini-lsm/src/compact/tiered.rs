@@ -39,6 +39,7 @@ pub struct TieredCompactionController {
 
 impl TieredCompactionController {
     pub fn new(options: TieredCompactionOptions) -> Self {
+        println!("{:?}", options);
         Self { options }
     }
 
