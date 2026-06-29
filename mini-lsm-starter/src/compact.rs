@@ -174,28 +174,6 @@ impl LsmStorageInner {
         }
     }
 
-    fn compact_tier(
-        &self,
-        task: &TieredCompactionTask,
-        snapshot: &LsmStorageState,
-    ) -> Result<Vec<Arc<SsTable>>> {
-        if let Some((last_tier, upper_tiers)) = task.tiers.split_last() {
-            let upper_tier_sst_ids = upper_tiers
-                .iter()
-                .flat_map(|(_, tier)| tier.to_vec())
-                .collect::<Vec<usize>>();
-            let last_tier_sst_ids = last_tier.1.to_vec();
-            self.compact_2_levels(
-                snapshot,
-                &upper_tier_sst_ids,
-                &last_tier_sst_ids,
-                task.bottom_tier_included,
-            )
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
     fn compact_2_levels(
         &self,
         snapshot: &LsmStorageState,
@@ -241,6 +219,41 @@ impl LsmStorageInner {
         }
 
         Ok(new_tables)
+    }
+
+    fn compact_tiered(
+        &self,
+        task: &TieredCompactionTask,
+        snapshot: &LsmStorageState,
+    ) -> Result<Vec<Arc<SsTable>>> {
+        if let Some((last_tier, upper_tiers)) = task.tiers.split_last() {
+            let upper_tier_sst_ids = upper_tiers
+                .iter()
+                .flat_map(|(_, tier)| tier.to_vec())
+                .collect::<Vec<usize>>();
+            let last_tier_sst_ids = last_tier.1.to_vec();
+            self.compact_2_levels(
+                snapshot,
+                &upper_tier_sst_ids,
+                &last_tier_sst_ids,
+                task.bottom_tier_included,
+            )
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn compact_leveled(
+        &self,
+        task: &LeveledCompactionTask,
+        snapshot: &LsmStorageState,
+    ) -> Result<Vec<Arc<SsTable>>> {
+        self.compact_2_levels(
+            snapshot,
+            &task.upper_level_sst_ids,
+            &task.lower_level_sst_ids,
+            task.is_lower_level_bottom_level,
+        )
     }
 
     pub fn force_full_compaction(&self) -> Result<()> {
@@ -334,7 +347,7 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    fn trigger_tier_compaction(
+    fn trigger_tiered_compaction(
         &self,
         snapshot: &LsmStorageState,
         controller: TieredCompactionController,
@@ -345,15 +358,50 @@ impl LsmStorageInner {
         }
 
         let task = _task.unwrap();
-        let compacted_sstables = self.compact_tier(&task, snapshot)?;
-        let compacted_sst_ids = compacted_sstables
+        let new_sstables = self.compact_tiered(&task, snapshot)?;
+        let new_sst_ids = new_sstables
             .iter()
             .map(|sst| sst.sst_id())
             .collect::<Vec<usize>>();
 
         let (mut new_engine, consumed_sst_ids) =
-            controller.apply_compaction_result(snapshot, &task, &compacted_sst_ids);
-        Self::update_engine_sstables(&mut new_engine, &consumed_sst_ids, compacted_sstables);
+            controller.apply_compaction_result(snapshot, &task, &new_sst_ids);
+        Self::update_engine_sstables(&mut new_engine, &consumed_sst_ids, new_sstables);
+
+        let mut guard = self.state.write();
+        *guard = Arc::new(new_engine);
+
+        Ok(())
+    }
+
+    fn trigger_leveled_compaction(
+        &self,
+        snapshot: &LsmStorageState,
+        controller: LeveledCompactionController,
+    ) -> Result<()> {
+        let task = controller.generate_compaction_task(snapshot);
+        if task.is_none() {
+            return Ok(());
+        }
+
+        let task = task.unwrap();
+        let new_sstables = self.compact_leveled(&task, snapshot)?;
+        let new_sst_ids = new_sstables
+            .iter()
+            .map(|sst| sst.sst_id())
+            .collect::<Vec<usize>>();
+
+        // Insert new sstables before applying compaction result because LeveledCompactionController::apply_compaction_result
+        // needs sort sstables(including new sstables) by first keys.
+        let mut snapshot = snapshot.clone();
+        for sst in new_sstables {
+            snapshot.sstables.insert(sst.sst_id(), sst);
+        }
+
+        let (mut new_engine, consumed_sst_ids) =
+            controller.apply_compaction_result(&snapshot, &task, &new_sst_ids, false);
+        // New sstables are already inserted.
+        Self::update_engine_sstables(&mut new_engine, &consumed_sst_ids, vec![]);
 
         let mut guard = self.state.write();
         *guard = Arc::new(new_engine);
@@ -374,9 +422,13 @@ impl LsmStorageInner {
             }
             CompactionOptions::Tiered(options) => {
                 let controller = TieredCompactionController::new(options.clone());
-                self.trigger_tier_compaction(&snapshot, controller)
+                self.trigger_tiered_compaction(&snapshot, controller)
             }
-            _ => unimplemented!(),
+            CompactionOptions::Leveled(options) => {
+                let controller = LeveledCompactionController::new(options.clone());
+                self.trigger_leveled_compaction(&snapshot, controller)
+            }
+            _ => unreachable!(),
         }
     }
 

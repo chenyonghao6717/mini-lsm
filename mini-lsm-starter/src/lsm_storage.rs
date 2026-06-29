@@ -642,6 +642,9 @@ impl LsmStorageInner {
     ) -> Result<MergeIterator<SstConcatIterator>> {
         let mut concat_iters = Vec::<Box<SstConcatIterator>>::new();
         for (level, sst_indices) in &engine.levels {
+            if sst_indices.is_empty() {
+                continue;
+            }
             concat_iters.push(Box::new(Self::to_concat_iter(
                 Arc::clone(&engine),
                 sst_indices,
