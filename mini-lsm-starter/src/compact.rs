@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
+use parking_lot::MutexGuard;
 use serde::{Deserialize, Serialize};
 pub use simple_leveled::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, SimpleLeveledCompactionTask,
@@ -34,6 +35,7 @@ use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -200,6 +202,16 @@ impl LsmStorageInner {
                 cur_builder = SsTableBuilder::new(self.options.block_size);
             }
             let value = two_merge_iterator.value();
+
+            if two_merge_iterator.key().raw_ref().starts_with(&[0; 4]) {
+                // Key 0 might be all zeros
+                println!(
+                    "Key 0 in compaction: value={:?}, is_empty={}",
+                    value.is_empty(),
+                    value.len()
+                );
+            }
+
             // Remove empty values in the lowest layer.
             if !is_lower_level_bottom_level || !value.is_empty() {
                 cur_builder.add(two_merge_iterator.key(), two_merge_iterator.value());
@@ -378,8 +390,11 @@ impl LsmStorageInner {
         &self,
         snapshot: &LsmStorageState,
         controller: LeveledCompactionController,
+        _state_lock_observer: &MutexGuard<()>,
     ) -> Result<()> {
         let task = controller.generate_compaction_task(snapshot);
+        // LeveledCompactionTask doesn't support clone so we have to redo the same process.
+        let manifest_task = controller.generate_compaction_task(snapshot);
         if task.is_none() {
             return Ok(());
         }
@@ -390,6 +405,15 @@ impl LsmStorageInner {
             .iter()
             .map(|sst| sst.sst_id())
             .collect::<Vec<usize>>();
+
+        self.sync_dir()?;
+        self.write_manifest_record(
+            ManifestRecord::Compaction(
+                CompactionTask::Leveled(manifest_task.unwrap()),
+                new_sst_ids.to_vec(),
+            ),
+            _state_lock_observer,
+        )?;
 
         // Insert new sstables before applying compaction result because LeveledCompactionController::apply_compaction_result
         // needs sort sstables(including new sstables) by first keys.
@@ -410,7 +434,7 @@ impl LsmStorageInner {
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        let _lock = self.state_lock.lock();
+        let lock = self.state_lock.lock();
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
@@ -426,7 +450,7 @@ impl LsmStorageInner {
             }
             CompactionOptions::Leveled(options) => {
                 let controller = LeveledCompactionController::new(options.clone());
-                self.trigger_leveled_compaction(&snapshot, controller)
+                self.trigger_leveled_compaction(&snapshot, controller, &lock)
             }
             _ => unreachable!(),
         }

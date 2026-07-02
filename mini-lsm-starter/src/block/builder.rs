@@ -16,7 +16,7 @@ use bytes::BufMut;
 
 use crate::key::KeySlice;
 
-use super::{Block, KEY_LEN_BYTES, NUM_OF_ELEMENTS_BYTES, OFFSET_BYTES, VAL_LEN_BYTES};
+use super::{Block, KEY_LEN_SIZE, NUM_OF_ELEMENTS_SIZE, OFFSET_SIZE, VALUE_LEN_SIZE};
 
 /// Builds a block.
 pub struct BlockBuilder {
@@ -43,20 +43,23 @@ impl BlockBuilder {
 
     fn get_entry_size(key: &[u8], value: &[u8]) -> usize {
         // Each k-v pair needs a u16 to store the key len, a u16 to store the value len.
-        KEY_LEN_BYTES + VAL_LEN_BYTES + key.len() + value.len()
+        KEY_LEN_SIZE + VALUE_LEN_SIZE + key.len() + value.len()
     }
 
     fn exceed_block_size(&self, entry_size: usize) -> bool {
-        let total_size_after_add = self.offsets.len() * OFFSET_BYTES
-            + self.data.len()
-            + NUM_OF_ELEMENTS_BYTES
+        let total_size_after_add = self.data.len()
+            + self.offsets.len() * OFFSET_SIZE
+            + NUM_OF_ELEMENTS_SIZE
             + entry_size
-            + OFFSET_BYTES;
+            // The offset of the entry to add
+            + OFFSET_SIZE;
 
         total_size_after_add > self.block_size
     }
 
-    /// DO NOT encode the first key since we don't store the first key before encoded.
+    /// For a non-first key, a u16 is used to indicate how many bytes of it are the same
+    /// as the first key, a u16 to indicate the rest part.
+    /// DO NOT encode the first key since we don't store the complete first key elsewhere.
     /// An encoded key looks like:
     /// | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) |
     fn encode_key(key: KeySlice, first_key: &[u8]) -> Vec<u8> {
@@ -138,7 +141,7 @@ impl BlockBuilder {
     }
 
     pub fn get_size(&self) -> usize {
-        self.data.len() + self.offsets.len() * OFFSET_BYTES
+        self.data.len() + self.offsets.len() * OFFSET_SIZE
     }
 
     pub fn get_key(&self, index: usize) -> Vec<u8> {
@@ -156,7 +159,7 @@ impl BlockBuilder {
 
             let key_len =
                 u16::from_le_bytes([self.data[entry_start], self.data[entry_start + 1]]) as usize;
-            let key_start = entry_start + KEY_LEN_BYTES;
+            let key_start = entry_start + KEY_LEN_SIZE;
             let key_end = key_start + key_len;
             let encoded_key = self.data[key_start..key_end].to_vec();
 

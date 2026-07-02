@@ -31,15 +31,17 @@ use bytes::{Buf, BufMut, Bytes};
 pub use iterator::SsTableIterator;
 
 use crate::block::Block;
+use crate::block::KEY_LEN_SIZE;
 use crate::key::{KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
-use crate::table::builder::META_BLOCK_OFFSET_BYTES;
 
 use self::bloom::Bloom;
-use super::block::{NUM_OF_ELEMENTS_BYTES, OFFSET_BYTES};
 
-pub const BLOCK_META_OFFSET_BYTES: u64 = size_of::<u32>() as u64;
-pub const BLOOM_OFFSET_BYTES: u64 = size_of::<u32>() as u64;
+const META_SECTION_OFFSET_SIZE: usize = 4;
+const BLOOM_OFFSET_SIZE: usize = 4;
+const NUM_OF_BLOCKS_SIZE: usize = 4;
+const BLOCK_OFFSET_SIZE: usize = 4;
+const META_OFFSET_SIZE: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -51,52 +53,57 @@ pub struct BlockMeta {
     pub last_key: KeyBytes,
 }
 
-/// Encoded block metas:
-/// | meta section |  meta offset section  | num of meta |
-/// |              |    num of meta * u16  |    u16      |
-/// An encoded meta:
+/// Block meta section layout:
+/// |       block meta section    |    meta offsets section   |   num of blocks   |
+/// | block meta 1 | block meta 2 | offset1 u32 | offset2 u32 |        u32        |
+/// Block meta layout:
 /// | offset | first_key | last_key | first_key_len |
-/// |   u16  |           |          |     u16       |
+/// |   u32  |           |          |     u16       |
 impl BlockMeta {
     /// Encode block meta to a buffer.
     /// You may add extra fields to the buffer,
     /// in order to help keep track of `first_key` when decoding from the same buffer in the future.
     pub fn encode_block_meta(block_meta: &[BlockMeta], buf: &mut Vec<u8>) {
-        let mut offsets = Vec::<u16>::new();
+        let mut meta_offsets = Vec::<u32>::new();
+        // Block meta section
         for meta in block_meta {
-            offsets.push(buf.len() as u16);
+            let meta_offset = buf.len() as u32;
+            meta_offsets.push(meta_offset);
 
-            buf.extend_from_slice(&(meta.offset as u16).to_le_bytes());
+            buf.put_u32_le(meta.offset as u32);
             buf.extend_from_slice(meta.first_key.raw_ref());
             buf.extend_from_slice(meta.last_key.raw_ref());
             buf.extend((meta.first_key.len() as u16).to_le_bytes());
         }
-        let num_of_meta = offsets.len() as u16;
-        for offset in offsets {
-            buf.put_u16_le(offset);
+        let num_of_meta = meta_offsets.len() as u32;
+        // Meta offsets section
+        for offset in meta_offsets {
+            buf.put_u32_le(offset);
         }
-        buf.put_u16_le(num_of_meta);
+        // Num of meta
+        buf.put_u32_le(num_of_meta);
     }
 
-    fn extract_meta(offsets: &[u16], meta_index: usize, meta_section: &[u8]) -> BlockMeta {
-        let meta_start = offsets[meta_index] as usize;
+    fn extract_meta(meta_offsets: &[u32], meta_index: usize, meta_section: &[u8]) -> BlockMeta {
+        let meta_start = meta_offsets[meta_index] as usize;
         let meta_end = {
-            if meta_index == offsets.len() - 1 {
+            if meta_index == meta_offsets.len() - 1 {
                 meta_section.len()
             } else {
-                offsets[meta_index + 1] as usize
+                meta_offsets[meta_index + 1] as usize
             }
         };
 
         let raw_meta = &meta_section[meta_start..meta_end];
-        let offset = u16::from_le_bytes([raw_meta[0], raw_meta[1]]) as usize;
-        let key_len =
+        let offset =
+            u32::from_le_bytes([raw_meta[0], raw_meta[1], raw_meta[2], raw_meta[3]]) as usize;
+        let first_key_len =
             u16::from_le_bytes([raw_meta[raw_meta.len() - 2], raw_meta[raw_meta.len() - 1]])
                 as usize;
 
-        let first_key_start = OFFSET_BYTES;
-        let last_key_start = OFFSET_BYTES + key_len;
-        let last_key_end = raw_meta.len() - OFFSET_BYTES;
+        let first_key_start = META_OFFSET_SIZE;
+        let last_key_start = first_key_start + first_key_len;
+        let last_key_end = raw_meta.len() - KEY_LEN_SIZE;
 
         let first_key = KeyBytes::from_bytes(Bytes::copy_from_slice(
             &raw_meta[first_key_start..last_key_start],
@@ -115,18 +122,27 @@ impl BlockMeta {
     pub fn decode_block_meta(buf: impl Buf) -> Vec<BlockMeta> {
         let raw = buf.chunk();
 
-        let num_of_meta = u16::from_le_bytes([raw[raw.len() - 2], raw[raw.len() - 1]]) as usize;
-        let first_offset_index = raw.len() - NUM_OF_ELEMENTS_BYTES - num_of_meta * OFFSET_BYTES;
-        let offsets = raw[first_offset_index..raw.len() - 2]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect::<Vec<u16>>();
+        let num_of_blocks = u32::from_le_bytes([
+            raw[raw.len() - 4],
+            raw[raw.len() - 3],
+            raw[raw.len() - 2],
+            raw[raw.len() - 1],
+        ]) as usize;
+
+        let meta_offsets_len = num_of_blocks * META_OFFSET_SIZE;
+        let first_offset_index = raw.len() - NUM_OF_BLOCKS_SIZE - meta_offsets_len;
+
+        let meta_offsets = raw[first_offset_index..raw.len() - NUM_OF_BLOCKS_SIZE]
+            .chunks_exact(META_OFFSET_SIZE)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<u32>>();
 
         let meta_section = &raw[0..first_offset_index];
         let mut metas = Vec::<BlockMeta>::new();
-        for meta_index in 0..num_of_meta {
-            metas.push(Self::extract_meta(&offsets, meta_index, meta_section))
+        for meta_index in 0..num_of_blocks {
+            metas.push(Self::extract_meta(&meta_offsets, meta_index, meta_section))
         }
+
         metas
     }
 }
@@ -167,6 +183,11 @@ impl FileObject {
 }
 
 /// An SSTable.
+/// -------------------------------------------------------------------------------------------
+/// |         Block Section         |          Meta Section         |          Extra          |
+/// -------------------------------------------------------------------------------------------
+/// | data block | ... | data block |            metadata           | meta block offset (u32) |
+/// -------------------------------------------------------------------------------------------
 pub struct SsTable {
     /// The actual storage unit of SsTable, the format is as above.
     pub(crate) file: FileObject,
@@ -222,6 +243,12 @@ impl SsTable {
     }
 
     /// See also SsTableBuilder::build
+    /// -----------------------------------------------------------------------------------------------------
+    /// |         Block Section         |                            Meta Section                           |
+    /// -----------------------------------------------------------------------------------------------------
+    /// | data block | ... | data block | metadata | meta block offset | bloom filter | bloom filter offset |
+    /// |                               |  varlen  |         u32       |    varlen    |        u32          |
+    /// -----------------------------------------------------------------------------------------------------
     fn get_section_range(file: &FileObject) -> Result<Option<SectionRange>> {
         if file.0.is_none() {
             return Ok(None);
@@ -229,19 +256,19 @@ impl SsTable {
 
         let file_size = file.size();
 
-        let bloom_offset_start = file_size - BLOOM_OFFSET_BYTES;
+        let bloom_offset_start = file_size - BLOOM_OFFSET_SIZE as u64;
         let bloom_offset_end = file_size;
 
-        let bloom_offset_bytes = file.read(bloom_offset_start, BLOCK_META_OFFSET_BYTES)?;
+        let bloom_offset_bytes = file.read(bloom_offset_start, BLOOM_OFFSET_SIZE as u64)?;
         let bloom_offset = Self::to_u32(&bloom_offset_bytes);
 
         let bloom_start = bloom_offset as u64;
         let bloom_end = bloom_offset_start;
 
-        let meta_offset_start = bloom_start - META_BLOCK_OFFSET_BYTES as u64;
+        let meta_offset_start = bloom_start - META_SECTION_OFFSET_SIZE as u64;
         let meta_offset_end = bloom_start;
 
-        let meta_offset_bytes = file.read(meta_offset_start, META_BLOCK_OFFSET_BYTES as u64)?;
+        let meta_offset_bytes = file.read(meta_offset_start, META_SECTION_OFFSET_SIZE as u64)?;
         let meta_offset = Self::to_u32(&meta_offset_bytes);
 
         let meta_start = meta_offset as u64;

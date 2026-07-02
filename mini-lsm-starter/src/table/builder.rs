@@ -31,8 +31,6 @@ use crate::{
     table::bloom::Bloom,
 };
 
-pub const META_BLOCK_OFFSET_BYTES: u32 = 4;
-
 /// Builds an SSTable from key-value pairs.
 pub struct SsTableBuilder {
     builder: BlockBuilder,
@@ -168,7 +166,7 @@ impl SsTableBuilder {
             .read(true)
             .write(true)
             .truncate(true)
-            .open(path)?;
+            .open(&path)?;
 
         // Write key-value data
         file.write_all(self.data.as_ref())?;

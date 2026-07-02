@@ -39,7 +39,6 @@ pub struct TieredCompactionController {
 
 impl TieredCompactionController {
     pub fn new(options: TieredCompactionOptions) -> Self {
-        println!("{:?}", options);
         Self { options }
     }
 
@@ -121,7 +120,6 @@ impl TieredCompactionController {
 
         let size_ratio_task = self.generate_size_ratio_compaction_task(_snapshot);
         if size_ratio_task.is_some() {
-            println!("size ratio compaction triggered");
             return size_ratio_task;
         }
 

@@ -229,25 +229,29 @@ impl LeveledCompactionController {
     }
 
     fn apply_compaction_result_to_lower(
-        _snapshot: &LsmStorageState,
+        snapshot: &LsmStorageState,
         new_engine: &mut LsmStorageState,
-        _task: &LeveledCompactionTask,
-        _output: &[usize],
+        task: &LeveledCompactionTask,
+        output: &[usize],
+        in_recovery: bool,
     ) {
-        let lower_level_id = _task.lower_level;
-        let mut new_lower_level = _snapshot.levels[lower_level_id - 1]
+        let lower_level_id = task.lower_level;
+        let mut new_lower_level = snapshot.levels[lower_level_id - 1]
             .1
             .iter()
             .copied()
-            .filter(|id| !_task.lower_level_sst_ids.contains(id))
+            .filter(|id| !task.lower_level_sst_ids.contains(id))
             .collect::<Vec<usize>>();
 
-        new_lower_level.extend_from_slice(_output);
-        new_lower_level.sort_by(|a, b| {
-            let key1 = new_engine.sstables[a].first_key();
-            let key2 = new_engine.sstables[b].first_key();
-            key1.cmp(key2)
-        });
+        new_lower_level.extend_from_slice(output);
+        // When in recovery, sstables are loaded yet, skip this sort
+        if !in_recovery {
+            new_lower_level.sort_by(|a, b| {
+                let key1 = new_engine.sstables[a].first_key();
+                let key2 = new_engine.sstables[b].first_key();
+                key1.cmp(key2)
+            });
+        }
         new_engine.levels[lower_level_id - 1] = (lower_level_id, new_lower_level);
     }
 
@@ -256,19 +260,25 @@ impl LeveledCompactionController {
     // while F and G need to be insert into where C, B were.
     pub fn apply_compaction_result(
         &self,
-        _snapshot: &LsmStorageState,
-        _task: &LeveledCompactionTask,
-        _output: &[usize],
-        _in_recovery: bool,
+        snapshot: &LsmStorageState,
+        task: &LeveledCompactionTask,
+        output: &[usize],
+        in_recovery: bool,
     ) -> (LsmStorageState, Vec<usize>) {
         let mut sst_ids_to_remove = Vec::<usize>::new();
-        sst_ids_to_remove.extend_from_slice(&_task.upper_level_sst_ids);
-        sst_ids_to_remove.extend_from_slice(&_task.lower_level_sst_ids);
+        sst_ids_to_remove.extend_from_slice(&task.upper_level_sst_ids);
+        sst_ids_to_remove.extend_from_slice(&task.lower_level_sst_ids);
 
-        let mut new_engine = _snapshot.clone();
+        let mut new_engine = snapshot.clone();
 
-        Self::apply_compaction_result_to_upper(_snapshot, &mut new_engine, _task);
-        Self::apply_compaction_result_to_lower(_snapshot, &mut new_engine, _task, _output);
+        Self::apply_compaction_result_to_upper(snapshot, &mut new_engine, task);
+        Self::apply_compaction_result_to_lower(
+            snapshot,
+            &mut new_engine,
+            task,
+            output,
+            in_recovery,
+        );
 
         (new_engine, sst_ids_to_remove)
     }

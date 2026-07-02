@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use crate::key::{KeySlice, KeyVec};
 
-use super::{Block, KEY_LEN_BYTES, VAL_LEN_BYTES};
+use super::{Block, KEY_LEN_SIZE, VALUE_LEN_SIZE};
 use crate::block::builder::BlockBuilder;
 
 /// Iterates on a block.
@@ -43,11 +43,11 @@ impl BlockIterator {
         }
 
         let key_len = u16::from_le_bytes([data[entry_start], data[entry_start + 1]]) as usize;
-        let key_start = entry_start + KEY_LEN_BYTES;
+        let key_start = entry_start + KEY_LEN_SIZE;
         let key_end = key_start + key_len;
 
         let value_len = u16::from_le_bytes([data[key_end], data[key_end + 1]]) as usize;
-        let value_start = key_end + VAL_LEN_BYTES;
+        let value_start = key_end + VALUE_LEN_SIZE;
         let value_end = value_start + value_len;
 
         Some((key_start, key_end, value_start, value_end))
