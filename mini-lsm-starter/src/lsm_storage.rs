@@ -527,12 +527,18 @@ impl LsmStorageInner {
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        for record in batch {
+            match record {
+                WriteBatchRecord::Put(key, value) => self.put(key.as_ref(), value.as_ref())?,
+                WriteBatchRecord::Del(key) => self.delete(key.as_ref())?,
+            }
+        }
+        Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         // Only the read lock is required because only the internal state of the
         // engine is being modified, the engine itself stays the same.
         // The write lock is required only when the engine itself is replaced, that is,
@@ -542,7 +548,7 @@ impl LsmStorageInner {
         // later readers and writer from seeing a mid-state engine.
         let needs_freeze = {
             let engine = self.state.read();
-            engine.memtable.put(_key, _value)?;
+            engine.memtable.put(key, value)?;
             engine.memtable.approximate_size() > self.options.target_sst_size
         };
 
@@ -562,8 +568,8 @@ impl LsmStorageInner {
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        self.put(_key, &[])
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.put(key, &[])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -604,6 +610,7 @@ impl LsmStorageInner {
         let new_engine = {
             // Freeze memtable
             let engine = self.state.read();
+
             let mut new_engine = (**engine).clone();
             new_engine.memtable.sync_wal()?;
             new_engine

@@ -203,15 +203,6 @@ impl LsmStorageInner {
             }
             let value = two_merge_iterator.value();
 
-            if two_merge_iterator.key().raw_ref().starts_with(&[0; 4]) {
-                // Key 0 might be all zeros
-                println!(
-                    "Key 0 in compaction: value={:?}, is_empty={}",
-                    value.is_empty(),
-                    value.len()
-                );
-            }
-
             // Remove empty values in the lowest layer.
             if !is_lower_level_bottom_level || !value.is_empty() {
                 cur_builder.add(two_merge_iterator.key(), two_merge_iterator.value());

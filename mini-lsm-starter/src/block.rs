@@ -29,6 +29,16 @@ pub const OFFSET_SIZE: usize = 2;
 pub const NUM_OF_ELEMENTS_SIZE: usize = 2;
 
 /// A block is the smallest unit of read and caching in LSM tree. It is a collection of sorted key-value pairs.
+/// ----------------------------------------------------------------------------------------------------
+/// |             Data Section             |              Offset Section             |      Extra      |
+/// ----------------------------------------------------------------------------------------------------
+/// | Entry #1 | Entry #2 | ... | Entry #N | Offset #1 | Offset #2 | ... | Offset #N | num_of_elements |
+/// ----------------------------------------------------------------------------------------------------
+/// -----------------------------------------------------------------------
+/// |                           Entry #1                            | ... |
+/// -----------------------------------------------------------------------
+/// | key_len (2B) | key (keylen) | value_len (2B) | value (varlen) | ... |
+/// -----------------------------------------------------------------------
 pub struct Block {
     pub(crate) data: Vec<u8>,
     pub(crate) offsets: Vec<u16>,
@@ -59,6 +69,7 @@ impl Block {
         let num_of_elements = u16::from_le_bytes([data[data_len - 2], data[data_len - 1]]) as usize;
 
         let offsets_len = num_of_elements * OFFSET_SIZE;
+
         let first_offset_index = data_len - offsets_len - NUM_OF_ELEMENTS_SIZE;
         let offsets_raw = &data[first_offset_index..data_len - NUM_OF_ELEMENTS_SIZE];
         let offsets: Vec<u16> = offsets_raw

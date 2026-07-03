@@ -61,19 +61,28 @@ impl SsTableBuilder {
         }
     }
 
-    /// Encode the current block into Vec<u8> and add it into self.data. Then create a new BlockBuilder.
-    fn freeze_block(&mut self) {
-        // Fill first_key and last_key of the current block meta.
+    /// Fill first_key and last_key of the current block meta.
+    fn fill_block_meta_keys(&mut self) {
         let block_count = self.meta.len();
         let current_block_meta = &mut self.meta[block_count - 1];
         current_block_meta.first_key = Key::from_bytes(Bytes::from(self.builder.get_first_key()));
         current_block_meta.last_key = Key::from_bytes(Bytes::from(self.builder.get_last_key()));
+    }
+
+    /// Encode the current block into Vec<u8> and add it into self.data. Then create a new BlockBuilder.
+    fn freeze_block(&mut self) {
+        self.fill_block_meta_keys();
 
         // Freeze the current block and create a new block.
         let new_builder = BlockBuilder::new(self.block_size);
         let current_builder = std::mem::replace(&mut self.builder, new_builder);
         let current_block_data = current_builder.build().encode();
-        self.data.append(&mut current_block_data.to_vec());
+
+        self.data.extend_from_slice(&current_block_data);
+
+        // Fill checksum
+        let checksum = crc32fast::hash(&current_block_data);
+        self.data.extend_from_slice(&u32::to_le_bytes(checksum));
 
         // Create a new meta for the newly created block.
         self.meta.push(BlockMeta {
@@ -130,8 +139,6 @@ impl SsTableBuilder {
     }
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.
-    /// | block section |    meta section    |    bloom section     |
-    /// |               | meta | meta offset | bloom | bloom offset |
     pub fn build(
         mut self,
         id: usize,
@@ -156,7 +163,7 @@ impl SsTableBuilder {
         let mut meta_buf = Vec::<u8>::new();
         BlockMeta::encode_block_meta(&self.meta, &mut meta_buf);
 
-        // Encode bloom
+        // Encode bloom(bloom checksum is handled in Bloom::encode)
         let mut bloom_buf = Vec::<u8>::new();
         let bloom = self.create_bloom();
         bloom.encode(&mut bloom_buf);
@@ -168,12 +175,18 @@ impl SsTableBuilder {
             .truncate(true)
             .open(&path)?;
 
-        // Write key-value data
+        // Write blocks
         file.write_all(self.data.as_ref())?;
 
-        // Write meta section
         let meta_section_offset = file.metadata()?.len();
+        // Write num of blocks.
+        file.write_all(&u32::to_le_bytes(self.meta.len() as u32))?;
+        // Write meta
         file.write_all(meta_buf.as_ref())?;
+        // Write checksum
+        let checksum = crc32fast::hash(meta_buf.as_ref());
+        file.write_all(&u32::to_le_bytes(checksum))?;
+        // Write meta offset
         file.write_all(&u32::to_le_bytes(meta_section_offset as u32))?;
 
         // Write bloom section
@@ -188,7 +201,7 @@ impl SsTableBuilder {
         Ok(SsTable {
             file: FileObject(Some(file), file_size),
             block_meta: self.meta,
-            block_meta_offset: meta_section_offset as usize,
+            meta_section_offset: meta_section_offset as usize,
             id,
             block_cache,
             first_key: KeyBytes::from_bytes(Bytes::copy_from_slice(&self.first_key)),

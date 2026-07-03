@@ -42,6 +42,7 @@ const BLOOM_OFFSET_SIZE: usize = 4;
 const NUM_OF_BLOCKS_SIZE: usize = 4;
 const BLOCK_OFFSET_SIZE: usize = 4;
 const META_OFFSET_SIZE: usize = 4;
+pub const CHECKSUM_SIZE: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockMeta {
@@ -53,9 +54,6 @@ pub struct BlockMeta {
     pub last_key: KeyBytes,
 }
 
-/// Block meta section layout:
-/// |       block meta section    |    meta offsets section   |   num of blocks   |
-/// | block meta 1 | block meta 2 | offset1 u32 | offset2 u32 |        u32        |
 /// Block meta layout:
 /// | offset | first_key | last_key | first_key_len |
 /// |   u32  |           |          |     u16       |
@@ -188,13 +186,24 @@ impl FileObject {
 /// -------------------------------------------------------------------------------------------
 /// | data block | ... | data block |            metadata           | meta block offset (u32) |
 /// -------------------------------------------------------------------------------------------
+/// ------------------------
+/// |      data block      |
+/// ------------------------
+/// | data | checksum(u32) |
+/// ------------------------
+/// ----------------------------------------------------------------------------------------------------------
+/// |                                                Meta Section                                            |
+/// ----------------------------------------------------------------------------------------------------------
+/// | no. of block | metadata | checksum | meta block offset | bloom filter | checksum | bloom filter offset |
+/// |     u32      |  varlen  |    u32   |        u32        |    varlen    |    u32   |        u32          |
+/// ----------------------------------------------------------------------------------------------------------
 pub struct SsTable {
     /// The actual storage unit of SsTable, the format is as above.
     pub(crate) file: FileObject,
     /// The meta blocks that hold info for data blocks.
     pub(crate) block_meta: Vec<BlockMeta>,
     /// The offset that indicates the start point of meta blocks in `file`.
-    pub(crate) block_meta_offset: usize,
+    pub(crate) meta_section_offset: usize,
     id: usize,
     block_cache: Option<Arc<BlockCache>>,
     first_key: KeyBytes,
@@ -206,14 +215,21 @@ pub struct SsTable {
 
 /// All ends are exclusive.
 struct SectionRange {
+    file_size: u64,
     data_start: u64,
     data_end: u64,
+    num_of_blocks_start: u64,
+    num_of_blocks_end: u64,
     meta_start: u64,
     meta_end: u64,
+    meta_checksum_start: u64,
+    meta_checksum_end: u64,
     meta_offset_start: u64,
     meta_offset_end: u64,
     bloom_start: u64,
     bloom_end: u64,
+    bloom_checksum_start: u64,
+    bloom_checksum_end: u64,
     bloom_offset_start: u64,
     bloom_offset_end: u64,
 }
@@ -228,7 +244,7 @@ impl SsTable {
         Ok(Self {
             file: FileObject(None, 0),
             block_meta: vec![],
-            block_meta_offset: 0,
+            meta_section_offset: 0,
             id,
             block_cache: None,
             first_key: KeyBytes::from_bytes(Bytes::new()),
@@ -242,13 +258,6 @@ impl SsTable {
         u32::from_le_bytes(bytes[..4].try_into().unwrap())
     }
 
-    /// See also SsTableBuilder::build
-    /// -----------------------------------------------------------------------------------------------------
-    /// |         Block Section         |                            Meta Section                           |
-    /// -----------------------------------------------------------------------------------------------------
-    /// | data block | ... | data block | metadata | meta block offset | bloom filter | bloom filter offset |
-    /// |                               |  varlen  |         u32       |    varlen    |        u32          |
-    /// -----------------------------------------------------------------------------------------------------
     fn get_section_range(file: &FileObject) -> Result<Option<SectionRange>> {
         if file.0.is_none() {
             return Ok(None);
@@ -262,68 +271,101 @@ impl SsTable {
         let bloom_offset_bytes = file.read(bloom_offset_start, BLOOM_OFFSET_SIZE as u64)?;
         let bloom_offset = Self::to_u32(&bloom_offset_bytes);
 
-        let bloom_start = bloom_offset as u64;
-        let bloom_end = bloom_offset_start;
+        let bloom_checksum_end = bloom_offset_start;
+        let bloom_checksum_start = bloom_checksum_end - CHECKSUM_SIZE as u64;
 
-        let meta_offset_start = bloom_start - META_SECTION_OFFSET_SIZE as u64;
+        let bloom_start = bloom_offset as u64;
+        let bloom_end = bloom_checksum_start;
+
         let meta_offset_end = bloom_start;
+        let meta_offset_start = meta_offset_end - META_SECTION_OFFSET_SIZE as u64;
 
         let meta_offset_bytes = file.read(meta_offset_start, META_SECTION_OFFSET_SIZE as u64)?;
         let meta_offset = Self::to_u32(&meta_offset_bytes);
 
-        let meta_start = meta_offset as u64;
-        let meta_end = meta_offset_start;
+        let meta_checksum_end = meta_offset_start;
+        let meta_checksum_start = meta_checksum_end - CHECKSUM_SIZE as u64;
+
+        let num_of_blocks_start = meta_offset as u64;
+        let num_of_blocks_end = num_of_blocks_start + NUM_OF_BLOCKS_SIZE as u64;
+
+        let meta_start = num_of_blocks_end;
+        let meta_end = meta_checksum_start;
 
         let data_start: u64 = 0;
-        let data_end = meta_start;
+        let data_end = num_of_blocks_start;
 
         Ok(Some(SectionRange {
+            file_size,
             data_start,
             data_end,
+            num_of_blocks_start,
+            num_of_blocks_end,
             meta_start,
             meta_end,
+            meta_checksum_start,
+            meta_checksum_end,
             meta_offset_start,
             meta_offset_end,
             bloom_start,
             bloom_end,
+            bloom_checksum_start,
+            bloom_checksum_end,
             bloom_offset_start,
             bloom_offset_end,
         }))
     }
 
+    fn read_bloom(section_range: &SectionRange, file: &FileObject) -> Result<Bloom> {
+        // Checksum is verified in Bloom::decode so both bloom part and checksum part need
+        // to be passed to Bloom:decode
+        let buf_len = section_range.bloom_checksum_end - section_range.bloom_start;
+        let raw_bloom = file.read(section_range.bloom_start, buf_len)?;
+        Bloom::decode(&raw_bloom)
+    }
+
+    fn read_meta(section_range: &SectionRange, file: &FileObject) -> Result<Vec<BlockMeta>> {
+        let raw_checksum = file.read(section_range.meta_checksum_start, CHECKSUM_SIZE as u64)?;
+        let checksum = u32::from_le_bytes([
+            raw_checksum[0],
+            raw_checksum[1],
+            raw_checksum[2],
+            raw_checksum[3],
+        ]);
+
+        let meta_buf_len = section_range.meta_end - section_range.meta_start;
+        let raw_meta = file.read(section_range.meta_start, meta_buf_len)?;
+
+        let actual_checksum = crc32fast::hash(&raw_meta);
+        if checksum != actual_checksum {
+            Err(anyhow!("Checksum mismatched for block meta!"))
+        } else {
+            Ok(BlockMeta::decode_block_meta(Cursor::new(raw_meta)))
+        }
+    }
+
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         let section_range = Self::get_section_range(&file)?;
-
         if section_range.is_none() {
             return Self::new(id);
         }
 
         let section_range = section_range.unwrap();
+        let block_meta = Self::read_meta(&section_range, &file)?;
+        let bloom = Self::read_bloom(&section_range, &file)?;
 
-        let block_metas = {
-            let buf_len = section_range.meta_end - section_range.meta_start;
-            let raw_meta = file.read(section_range.meta_start, buf_len)?;
-            BlockMeta::decode_block_meta(Cursor::new(raw_meta))
-        };
-
-        let bloom = {
-            let buf_len = section_range.bloom_end - section_range.bloom_start;
-            let raw_bloom = file.read(section_range.bloom_start, buf_len)?;
-            Bloom::decode(&raw_bloom)
-        }?;
-
-        let first_key = block_metas
+        let first_key = block_meta
             .first()
             .map_or(KeyBytes::from_bytes(Bytes::new()), |x| x.first_key.clone());
-        let last_key = block_metas
+        let last_key = block_meta
             .last()
             .map_or(KeyBytes::from_bytes(Bytes::new()), |x| x.last_key.clone());
 
         Ok(Self {
             file,
-            block_meta: block_metas,
-            block_meta_offset: section_range.meta_start as usize,
+            block_meta,
+            meta_section_offset: section_range.num_of_blocks_start as usize,
             id,
             block_cache,
             first_key,
@@ -343,7 +385,7 @@ impl SsTable {
         Self {
             file: FileObject(None, file_size),
             block_meta: vec![],
-            block_meta_offset: 0,
+            meta_section_offset: 0,
             id,
             block_cache: None,
             first_key,
@@ -354,6 +396,10 @@ impl SsTable {
     }
 
     /// Read a block from the disk.
+    /// Block layout:
+    /// -------------------------------
+    /// | block data | checksum (u32) |
+    /// -------------------------------
     pub fn read_block(&self, block_idx: usize) -> Result<Arc<Block>> {
         if block_idx >= self.block_meta.len() {
             Err(anyhow!(
@@ -366,12 +412,14 @@ impl SsTable {
             let block_end = if block_idx < self.block_meta.len() - 1 {
                 self.block_meta[block_idx + 1].offset
             } else {
-                self.block_meta_offset
+                self.meta_section_offset
             } as u64;
 
-            let raw_block = self.file.read(block_start, block_end - block_start)?;
-            let block = Block::decode(&raw_block);
+            let raw_block = self
+                .file
+                .read(block_start, block_end - block_start - CHECKSUM_SIZE as u64)?;
 
+            let block = Block::decode(&raw_block);
             Ok(Arc::new(block))
         }
     }
