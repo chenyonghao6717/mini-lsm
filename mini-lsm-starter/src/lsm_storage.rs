@@ -304,16 +304,31 @@ impl LsmStorageInner {
             let sst = Self::load_sst(*new_sst_id, block_cache, path)?;
             snapshot.sstables.insert(*new_sst_id, sst);
         }
-        let (new_state, _sst_ids_to_delete) = compaction_controller.apply_compaction_result(
+        let (mut new_state, sst_ids_to_delete) = compaction_controller.apply_compaction_result(
             &snapshot,
             task,
             new_sst_ids,
             in_recovery,
         );
-        // for id in &sst_ids_to_delete {
-        //     new_state.sstables.remove(id);
-        // }
+        for id in &sst_ids_to_delete {
+            new_state.sstables.remove(id);
+        }
         Ok(new_state)
+    }
+
+    fn load_memtable_manifest(
+        memtable_id: usize,
+        mut snapshot: LsmStorageState,
+        path: &Path,
+    ) -> Result<LsmStorageState> {
+        // The memtable is flushed already.
+        if snapshot.sstables.contains_key(&memtable_id) {
+            Ok(snapshot)
+        } else {
+            let memtable = MemTable::recover_from_wal(memtable_id, path)?;
+            snapshot.imm_memtables.insert(0, Arc::new(memtable));
+            Ok(snapshot)
+        }
     }
 
     fn load_manifest(
@@ -342,7 +357,9 @@ impl LsmStorageInner {
                     path,
                     true,
                 )?,
-                _ => unreachable!(),
+                ManifestRecord::NewMemtable(memtable_id) => {
+                    Self::load_memtable_manifest(*memtable_id, state, path)?
+                }
             }
         }
 
@@ -583,14 +600,29 @@ impl LsmStorageInner {
     }
 
     /// Force freeze the current memtable to an immutable memtable
-    pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
+    pub fn force_freeze_memtable(&self, state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
         let new_engine = {
+            // Freeze memtable
             let engine = self.state.read();
             let mut new_engine = (**engine).clone();
+            new_engine.memtable.sync_wal()?;
             new_engine
                 .imm_memtables
                 .insert(0, Arc::clone(&new_engine.memtable));
-            new_engine.memtable = Arc::new(MemTable::create(self.next_sst_id()));
+
+            // Create a new memtable
+            let new_memtable_id = self.next_sst_id();
+            if self.options.enable_wal {
+                new_engine.memtable =
+                    Arc::new(MemTable::create_with_wal(new_memtable_id, &self.path)?);
+                self.write_manifest_record(
+                    ManifestRecord::NewMemtable(new_memtable_id),
+                    state_lock_observer,
+                )?;
+            } else {
+                new_engine.memtable = Arc::new(MemTable::create(new_memtable_id));
+            }
+
             new_engine
         };
 
@@ -611,7 +643,7 @@ impl LsmStorageInner {
             (**engine).clone()
         };
         let memtable = new_engine.imm_memtables.last().unwrap();
-        let sst_id = self.next_sst_id();
+        let sst_id = memtable.id();
 
         // Build SST (protected by self.state_lock)
         let mut table_builder = SsTableBuilder::new(self.options.block_size);
