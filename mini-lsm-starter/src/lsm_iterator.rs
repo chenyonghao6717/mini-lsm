@@ -60,13 +60,13 @@ impl StorageIterator for LsmIterator {
         }
         match &self.end_bound {
             Bound::Unbounded => true,
-            Bound::Included(end_key) => self.inner.key().raw_ref() <= end_key.as_ref(),
-            Bound::Excluded(end_key) => self.inner.key().raw_ref() < end_key.as_ref(),
+            Bound::Included(end_key) => self.inner.key().key_ref() <= end_key.as_ref(),
+            Bound::Excluded(end_key) => self.inner.key().key_ref() < end_key.as_ref(),
         }
     }
 
     fn key(&self) -> &[u8] {
-        self.inner.key().raw_ref()
+        self.inner.key().key_ref()
     }
 
     fn value(&self) -> &[u8] {
@@ -74,6 +74,7 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
+        println!("LSM key: {:?}", self.inner.key().key_ref());
         self.inner.next()?;
         // If the current value is &[], it's a mark of a deleted key.
         // We need to call next() again until the next valid key.

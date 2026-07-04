@@ -32,6 +32,7 @@ pub use iterator::SsTableIterator;
 
 use crate::block::Block;
 use crate::block::KEY_LEN_SIZE;
+use crate::key::TS_DEFAULT;
 use crate::key::{KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
 
@@ -69,9 +70,11 @@ impl BlockMeta {
             meta_offsets.push(meta_offset);
 
             buf.put_u32_le(meta.offset as u32);
-            buf.extend_from_slice(meta.first_key.raw_ref());
-            buf.extend_from_slice(meta.last_key.raw_ref());
-            buf.extend((meta.first_key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(meta.first_key.key_ref());
+            buf.put_u64_le(meta.first_key.ts());
+            buf.extend_from_slice(meta.last_key.key_ref());
+            buf.put_u64_le(meta.last_key.ts());
+            buf.put_u16_le(meta.first_key.raw_len() as u16);
         }
         let num_of_meta = meta_offsets.len() as u32;
         // Meta offsets section
@@ -247,8 +250,8 @@ impl SsTable {
             meta_section_offset: 0,
             id,
             block_cache: None,
-            first_key: KeyBytes::from_bytes(Bytes::new()),
-            last_key: KeyBytes::from_bytes(Bytes::new()),
+            first_key: KeyBytes::from_bytes_with_ts(Bytes::new(), TS_DEFAULT),
+            last_key: KeyBytes::from_bytes_with_ts(Bytes::new(), TS_DEFAULT),
             bloom: None,
             max_ts: 0,
         })
@@ -355,12 +358,14 @@ impl SsTable {
         let block_meta = Self::read_meta(&section_range, &file)?;
         let bloom = Self::read_bloom(&section_range, &file)?;
 
-        let first_key = block_meta
-            .first()
-            .map_or(KeyBytes::from_bytes(Bytes::new()), |x| x.first_key.clone());
-        let last_key = block_meta
-            .last()
-            .map_or(KeyBytes::from_bytes(Bytes::new()), |x| x.last_key.clone());
+        let first_key = block_meta.first().map_or(
+            KeyBytes::from_bytes_with_ts(Bytes::new(), TS_DEFAULT),
+            |x| x.first_key.clone(),
+        );
+        let last_key = block_meta.last().map_or(
+            KeyBytes::from_bytes_with_ts(Bytes::new(), TS_DEFAULT),
+            |x| x.last_key.clone(),
+        );
 
         Ok(Self {
             file,
@@ -470,12 +475,12 @@ impl SsTable {
     pub fn has_overlap(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> bool {
         match _lower {
             Bound::Included(lower_key) => {
-                if lower_key > self.last_key.as_key_slice().raw_ref() {
+                if lower_key > self.last_key.as_key_slice().key_ref() {
                     return false;
                 }
             }
             Bound::Excluded(lower_key) => {
-                if lower_key >= self.last_key.as_key_slice().raw_ref() {
+                if lower_key >= self.last_key.as_key_slice().key_ref() {
                     return false;
                 }
             }
@@ -484,12 +489,12 @@ impl SsTable {
 
         match _upper {
             Bound::Included(upper_key) => {
-                if upper_key < self.first_key.as_key_slice().raw_ref() {
+                if upper_key < self.first_key.as_key_slice().key_ref() {
                     return false;
                 }
             }
             Bound::Excluded(upper_key) => {
-                if upper_key <= self.first_key.as_key_slice().raw_ref() {
+                if upper_key <= self.first_key.as_key_slice().key_ref() {
                     return false;
                 }
             }

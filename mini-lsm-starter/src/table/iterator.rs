@@ -18,14 +18,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use bytes::Bytes;
 
 use super::SsTable;
-use crate::{
-    block::BlockIterator,
-    iterators::StorageIterator,
-    key::{KeyBytes, KeySlice},
-};
+use crate::{block::BlockIterator, iterators::StorageIterator, key::KeySlice};
 
 /// An iterator over the contents of an SSTable.
 pub struct SsTableIterator {
@@ -74,8 +69,6 @@ impl SsTableIterator {
         let mut l = 0;
         let mut r = self.table.block_meta.len() - 1;
 
-        let key_str = KeyBytes::from_bytes(Bytes::copy_from_slice(key.raw_ref()));
-
         while l < r {
             let mid = (l + r) >> 1;
 
@@ -83,9 +76,9 @@ impl SsTableIterator {
             let start_key = &meta.first_key;
             let end_key = &meta.last_key;
 
-            if key < start_key.as_key_slice() {
+            if key.key_ref() < start_key.key_ref() {
                 r = mid;
-            } else if end_key.as_key_slice() < key {
+            } else if end_key.key_ref() < key.key_ref() {
                 l = mid + 1;
             } else {
                 l = mid;

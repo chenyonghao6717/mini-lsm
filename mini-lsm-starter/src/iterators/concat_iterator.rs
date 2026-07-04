@@ -38,7 +38,7 @@ impl SstConcatIterator {
         // An empty key means we start from the first table.
         if key.is_empty() || sstables.is_empty() {
             0
-        } else if key.raw_ref() > sstables.last().as_ref().unwrap().last_key().raw_ref() {
+        } else if key.key_ref() > sstables.last().as_ref().unwrap().last_key().key_ref() {
             sstables.len() + 1
         } else {
             let mut l = 0;
@@ -46,7 +46,7 @@ impl SstConcatIterator {
             while l < r {
                 let mid = l + (r - l) / 2;
                 let table = &sstables[mid];
-                if key.raw_ref() <= table.last_key().raw_ref() {
+                if key.key_ref() <= table.last_key().key_ref() {
                     r = mid;
                 } else {
                     l = mid + 1;

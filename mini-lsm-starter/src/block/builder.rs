@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::BufMut;
+use bytes::{BufMut, Bytes};
 
-use crate::key::KeySlice;
+use crate::key::{KeyBytes, KeySlice, TS_DEFAULT, TS_SIZE};
 
 use super::{Block, KEY_LEN_SIZE, NUM_OF_ELEMENTS_SIZE, OFFSET_SIZE, VALUE_LEN_SIZE};
 
@@ -61,10 +61,10 @@ impl BlockBuilder {
     /// as the first key, a u16 to indicate the rest part.
     /// DO NOT encode the first key since we don't store the complete first key elsewhere.
     /// An encoded key looks like:
-    /// | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) |
+    /// | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | timestamp (u32) |
     fn encode_key(key: KeySlice, first_key: &[u8]) -> Vec<u8> {
         let mut overlap_len: u16 = 0;
-        for (byte1, byte2) in key.raw_ref().iter().zip(first_key.iter()) {
+        for (byte1, byte2) in key.key_ref().iter().zip(first_key.iter()) {
             if byte1 == byte2 {
                 overlap_len += 1;
             } else {
@@ -72,29 +72,31 @@ impl BlockBuilder {
             }
         }
 
-        let rest_len = key.len() as u16 - overlap_len;
+        let rest_len = key.key_len() as u16 - overlap_len;
         let mut encoded_key = Vec::<u8>::new();
-
-        // println!("{} {} {}", first_key.len(), overlap_len, rest_len);
-        // println!("{:?}", std::str::from_utf8(key.raw_ref()));
 
         encoded_key.extend_from_slice(&overlap_len.to_le_bytes());
         encoded_key.extend_from_slice(&rest_len.to_le_bytes());
-        encoded_key.extend_from_slice(&key.raw_ref()[overlap_len as usize..]);
+        encoded_key.extend_from_slice(&key.key_ref()[overlap_len as usize..]);
+        encoded_key.extend_from_slice(&u64::to_le_bytes(key.ts()));
 
         encoded_key
     }
 
     /// See also Self::encode_key
-    pub fn decode_key(encoded_key: &[u8], first_key: &[u8]) -> Vec<u8> {
+    pub fn decode_key(encoded_key: &[u8], first_key: &[u8]) -> KeyBytes {
+        let raw_ts = &encoded_key[encoded_key.len() - TS_SIZE..];
+        let ts = u64::from_le_bytes([
+            raw_ts[0], raw_ts[1], raw_ts[2], raw_ts[3], raw_ts[4], raw_ts[5], raw_ts[6], raw_ts[7],
+        ]);
+
         let overlap_len = u16::from_le_bytes([encoded_key[0], encoded_key[1]]);
         let rest_len = u16::from_le_bytes([encoded_key[2], encoded_key[3]]);
+        let rest_key = &encoded_key[2 * size_of::<u16>()..encoded_key.len() - TS_SIZE];
 
         let mut decoded_key = first_key[..overlap_len as usize].to_vec();
-        decoded_key.extend_from_slice(
-            &encoded_key[(size_of_val(&overlap_len) + size_of_val(&rest_len))..],
-        );
-        decoded_key
+        decoded_key.extend_from_slice(rest_key);
+        KeyBytes::from_bytes_with_ts(Bytes::from_owner(decoded_key), ts)
     }
 
     /// Adds a key-value pair to the block. Returns false when the block is full.
@@ -105,8 +107,10 @@ impl BlockBuilder {
     pub fn add(&mut self, key: KeySlice, value: &[u8]) -> bool {
         // We don't encode the first key.
         let encoded_key = if self.first_key.is_empty() {
-            self.first_key = key.raw_ref().to_vec();
-            key.raw_ref().to_vec()
+            self.first_key = key.key_ref().to_vec();
+            let mut full_key = key.key_ref().to_vec();
+            full_key.extend_from_slice(&u64::to_be_bytes(key.ts()));
+            full_key
         } else {
             Self::encode_key(key, &self.first_key)
         };
@@ -144,9 +148,9 @@ impl BlockBuilder {
         self.data.len() + self.offsets.len() * OFFSET_SIZE
     }
 
-    pub fn get_key(&self, index: usize) -> Vec<u8> {
+    pub fn get_key(&self, index: usize) -> KeyBytes {
         if index >= self.offsets.len() {
-            Vec::new()
+            KeyBytes::from_bytes_with_ts(Bytes::new(), TS_DEFAULT)
         } else {
             let entry_start = self.offsets[index] as usize;
             let entry_end = {
@@ -165,20 +169,20 @@ impl BlockBuilder {
 
             // The first key is not encoded.
             if index == 0 {
-                encoded_key
+                KeyBytes::from_bytes(Bytes::copy_from_slice(&encoded_key))
             } else {
                 Self::decode_key(&encoded_key, &self.first_key)
             }
         }
     }
 
-    pub fn get_first_key(&self) -> Vec<u8> {
+    pub fn get_first_key(&self) -> KeyBytes {
         self.get_key(0)
     }
 
-    pub fn get_last_key(&self) -> Vec<u8> {
+    pub fn get_last_key(&self) -> KeyBytes {
         if self.offsets.is_empty() {
-            Vec::new()
+            KeyBytes::from_bytes_with_ts(Bytes::new(), TS_DEFAULT)
         } else {
             self.get_key(self.offsets.len() - 1)
         }

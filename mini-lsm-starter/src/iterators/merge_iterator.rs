@@ -21,7 +21,7 @@ use std::collections::binary_heap::PeekMut;
 
 use anyhow::Result;
 
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_DEFAULT};
 
 use super::StorageIterator;
 
@@ -88,7 +88,7 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         if let Some(wrapper) = &self.current {
             wrapper.1.key()
         } else {
-            KeySlice::from_slice(&[])
+            KeySlice::from_slice(&[], TS_DEFAULT)
         }
     }
 
