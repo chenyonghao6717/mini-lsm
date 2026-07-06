@@ -106,7 +106,9 @@ impl MemTable {
     /// Get a value by key.
     /// In week3 this function is only for testing.
     pub fn get(&self, key: KeySlice) -> Option<Bytes> {
-        let raw_key_bytes = Bytes::from_static(unsafe { std::mem::transmute(key.key_ref()) });
+        let raw_key_bytes = Bytes::from_static(unsafe {
+            std::mem::transmute::<&[u8], &'static [u8]>(key.key_ref())
+        });
         let key_bytes = KeyBytes::from_bytes_with_ts(raw_key_bytes, key.ts());
         self.map.get(&key_bytes).map(|x| x.value().clone())
     }

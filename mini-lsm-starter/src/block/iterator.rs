@@ -112,7 +112,7 @@ impl BlockIterator {
                 Self::get_kv_range(&block.data, offset as usize)
             {
                 let mid_key = Self::get_key(&block.data, key_start, key_end, mid, first_key);
-                if key.key_ref() <= mid_key.key_ref() {
+                if key <= mid_key.as_key_slice() {
                     r = mid;
                 } else {
                     l = mid + 1;

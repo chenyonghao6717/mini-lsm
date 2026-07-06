@@ -115,14 +115,6 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         let key = self.current.as_ref().unwrap().1.key();
 
         while let Some(mut wrapper) = self.iters.peek_mut() {
-            let inner_key = wrapper.1.key();
-            println!(
-                "current_key_ref: {:?}, current_key_ts: {}, inner_key_ref: {:?}, inner_key_ts: {:?}",
-                key.key_ref(),
-                key.ts(),
-                inner_key.key_ref(),
-                inner_key.ts()
-            );
             if !wrapper.1.is_valid() {
                 PeekMut::pop(wrapper);
             } else if wrapper.1.key() == key {

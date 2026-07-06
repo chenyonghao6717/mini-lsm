@@ -61,7 +61,7 @@ impl BlockBuilder {
     /// as the first key, a u16 to indicate the rest part.
     /// DO NOT encode the first key since we don't store the complete first key elsewhere.
     /// An encoded key looks like:
-    /// | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | timestamp (u32) |
+    /// | key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | timestamp (u64) |
     fn encode_key(key: KeySlice, first_key: &[u8]) -> Vec<u8> {
         let mut overlap_len: u16 = 0;
         for (byte1, byte2) in key.key_ref().iter().zip(first_key.iter()) {
@@ -109,7 +109,7 @@ impl BlockBuilder {
         let encoded_key = if self.first_key.is_empty() {
             self.first_key = key.key_ref().to_vec();
             let mut full_key = key.key_ref().to_vec();
-            full_key.extend_from_slice(&u64::to_be_bytes(key.ts()));
+            full_key.extend_from_slice(&u64::to_le_bytes(key.ts()));
             full_key
         } else {
             Self::encode_key(key, &self.first_key)

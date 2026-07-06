@@ -76,9 +76,9 @@ impl SsTableIterator {
             let start_key = &meta.first_key;
             let end_key = &meta.last_key;
 
-            if key.key_ref() < start_key.key_ref() {
+            if key < start_key.as_key_slice() {
                 r = mid;
-            } else if end_key.key_ref() < key.key_ref() {
+            } else if end_key.as_key_slice() < key {
                 l = mid + 1;
             } else {
                 l = mid;

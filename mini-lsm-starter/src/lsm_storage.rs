@@ -35,7 +35,7 @@ use crate::compact::{
 use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::key::{KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END};
+use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
@@ -462,7 +462,7 @@ impl LsmStorageInner {
                 }
                 let iter = SsTableIterator::create_and_seek_to_key(
                     sst.clone(),
-                    KeySlice::from_slice(_key, TS_DEFAULT),
+                    KeySlice::from_slice(_key, TS_RANGE_BEGIN),
                 )?;
                 let k = iter.key();
                 let v = iter.value();
@@ -507,22 +507,7 @@ impl LsmStorageInner {
         }
     }
 
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        let _mvcc_guard = self.mvcc().write_lock.lock();
-        let ts = self.mvcc().latest_commit_ts() + 1;
-        for record in batch {
-            match record {
-                WriteBatchRecord::Put(key, value) => self.put(key.as_ref(), value.as_ref())?,
-                WriteBatchRecord::Del(key) => self.delete(key.as_ref())?,
-            }
-        }
-        self.mvcc().update_commit_ts(ts);
-        Ok(())
-    }
-
-    /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put_with_ts(&self, key: &[u8], value: &[u8], ts: u64) -> Result<()> {
         // Only the read lock is required because only the internal state of the
         // engine is being modified, the engine itself stays the same.
         // The write lock is required only when the engine itself is replaced, that is,
@@ -532,9 +517,7 @@ impl LsmStorageInner {
         // later readers and writer from seeing a mid-state engine.
         let needs_freeze = {
             let engine = self.state.read();
-            engine
-                .memtable
-                .put(KeySlice::from_slice(key, TS_DEFAULT), value)?;
+            engine.memtable.put(KeySlice::from_slice(key, ts), value)?;
             engine.memtable.approximate_size() > self.options.target_sst_size
         };
 
@@ -553,9 +536,30 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Write a batch of data into the storage. Implement in week 2 day 7.
+    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        let _mvcc_guard = self.mvcc().write_lock.lock();
+        let ts = self.mvcc().latest_commit_ts() + 1;
+        for record in batch {
+            match record {
+                WriteBatchRecord::Put(key, value) => {
+                    self.put_with_ts(key.as_ref(), value.as_ref(), ts)?
+                }
+                WriteBatchRecord::Del(key) => self.put_with_ts(key.as_ref(), &[], ts)?,
+            }
+        }
+        self.mvcc().update_commit_ts(ts);
+        Ok(())
+    }
+
+    /// Put a key-value pair into the storage by writing into the current memtable.
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.write_batch(&[WriteBatchRecord::Put(key, value)])
+    }
+
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, key: &[u8]) -> Result<()> {
-        self.put(key, &[])
+        self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -644,11 +648,11 @@ impl LsmStorageInner {
         // Build SST (protected by self.state_lock)
         let mut table_builder = SsTableBuilder::new(self.options.block_size);
         memtable.flush(&mut table_builder)?;
-        let sstable = table_builder.build(
+        let sstable = Arc::new(table_builder.build(
             sst_id,
             Some(Arc::clone(&self.block_cache)),
             self.path_of_sst(sst_id),
-        )?;
+        )?);
 
         // Sync folder after sst is created.
         self.sync_dir()?;
@@ -666,7 +670,7 @@ impl LsmStorageInner {
             // Tiered strategy doesn't use l0.
             new_engine.levels.insert(0, (sst_id, vec![sst_id]));
         }
-        new_engine.sstables.insert(sst_id, Arc::new(sstable));
+        new_engine.sstables.insert(sst_id, sstable);
         new_engine.imm_memtables.pop();
 
         let mut engine = self.state.write();
@@ -707,7 +711,7 @@ impl LsmStorageInner {
     }
 
     fn to_memtables_merge_iter(
-        engine: Arc<LsmStorageState>,
+        engine: &LsmStorageState,
         lower: Bound<KeySlice>,
         upper: Bound<KeySlice>,
     ) -> MergeIterator<MemTableIterator> {
@@ -788,14 +792,14 @@ impl LsmStorageInner {
     }
 
     fn to_non_l0_merge_iter(
-        state: &Arc<LsmStorageState>,
+        state: &LsmStorageState,
         lower: Bound<KeySlice>,
         upper: Bound<KeySlice>,
     ) -> Result<MergeIterator<MergeIterator<SsTableIterator>>> {
         let non_l0_sst_iters = state
             .levels
             .iter()
-            .map(|(id, _)| Self::to_level_iter(*id, &state, lower, upper).map(Box::new))
+            .map(|(id, _)| Self::to_level_iter(*id, state, lower, upper).map(Box::new))
             .collect::<Result<Vec<Box<_>>>>()?;
         Ok(MergeIterator::create(non_l0_sst_iters))
     }
@@ -813,8 +817,7 @@ impl LsmStorageInner {
         let lower = lower.map(|key| KeySlice::from_slice(key, TS_RANGE_BEGIN));
         let upper = upper.map(|key| KeySlice::from_slice(key, TS_RANGE_END));
 
-        let memtables_merge_iter =
-            Self::to_memtables_merge_iter(Arc::clone(&snapshot), lower, upper);
+        let memtables_merge_iter = Self::to_memtables_merge_iter(&snapshot, lower, upper);
         let l0_sst_merge_iter = Self::to_level_iter(0, &snapshot, lower, upper)?;
         let non_l0_sst_merge_iter = Self::to_non_l0_merge_iter(&snapshot, lower, upper)?;
 
