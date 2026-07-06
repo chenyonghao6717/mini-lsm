@@ -19,8 +19,7 @@ use bytes::Bytes;
 
 use crate::{
     iterators::{
-        StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
-        two_merge_iterator::TwoMergeIterator,
+        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
     },
     mem_table::MemTableIterator,
     table::SsTableIterator,
@@ -29,12 +28,13 @@ use crate::{
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
 type LsmIteratorInner = TwoMergeIterator<
     TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
-    MergeIterator<SstConcatIterator>,
+    MergeIterator<MergeIterator<SsTableIterator>>,
 >;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     end_bound: Bound<Bytes>,
+    prev_key: Vec<u8>,
 }
 
 impl LsmIterator {
@@ -42,10 +42,10 @@ impl LsmIterator {
         let mut self_ = Self {
             inner: iter,
             end_bound,
+            prev_key: Vec::new(),
         };
-        // The first key might be a deleted key, so we need to call next() until we find a non-empty key.
-        if self_.is_valid() && self_.value().is_empty() {
-            self_.next()?;
+        if self_.is_valid() {
+            self_.prev_key = self_.inner.key().key_ref().to_vec();
         }
         Ok(self_)
     }
@@ -74,12 +74,19 @@ impl StorageIterator for LsmIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        println!("LSM key: {:?}", self.inner.key().key_ref());
         self.inner.next()?;
-        // If the current value is &[], it's a mark of a deleted key.
-        // We need to call next() again until the next valid key.
-        while self.is_valid() && self.value().is_empty() {
-            self.inner.next()?;
+        while self.is_valid() {
+            if self.prev_key.as_slice() == self.key() {
+                self.inner.next()?;
+            } else if self.value().is_empty() {
+                self.prev_key = self.key().to_vec();
+                self.inner.next()?;
+            } else {
+                break;
+            }
+        }
+        if self.is_valid() {
+            self.prev_key = self.key().to_vec();
         }
         Ok(())
     }

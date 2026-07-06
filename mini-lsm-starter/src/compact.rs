@@ -181,7 +181,7 @@ impl LsmStorageInner {
         snapshot: &LsmStorageState,
         upper_sst_ids: &[usize],
         lower_sst_ids: &[usize],
-        is_lower_level_bottom_level: bool,
+        _is_lower_level_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut two_merge_iterator = TwoMergeIterator::create(
             Self::get_table_merge_iter(upper_sst_ids, snapshot)?,
@@ -190,8 +190,11 @@ impl LsmStorageInner {
         let mut new_tables = Vec::<Arc<SsTable>>::new();
         let mut cur_builder = SsTableBuilder::new(self.options.block_size);
 
+        let mut previous_key = Vec::<u8>::new();
         while two_merge_iterator.is_valid() {
-            if cur_builder.estimated_size() > self.options.target_sst_size {
+            // Make sure all keys with the same key value are put in the same SST.
+            let same_key = previous_key.as_slice() == two_merge_iterator.key().key_ref();
+            if !same_key && cur_builder.estimated_size() > self.options.target_sst_size {
                 let id = self.next_sst_id();
                 let new_table = cur_builder.build(
                     id,
@@ -203,10 +206,16 @@ impl LsmStorageInner {
             }
             let value = two_merge_iterator.value();
 
-            // Remove empty values in the lowest layer.
-            if !is_lower_level_bottom_level || !value.is_empty() {
-                cur_builder.add(two_merge_iterator.key(), two_merge_iterator.value());
+            if !same_key {
+                previous_key = two_merge_iterator.key().key_ref().to_vec();
             }
+
+            // Remove empty values in the lowest layer.
+            // Commented in week3 day2.
+            // if !is_lower_level_bottom_level || !value.is_empty() {
+            //     cur_builder.add(two_merge_iterator.key(), two_merge_iterator.value());
+            // }
+            cur_builder.add(two_merge_iterator.key(), two_merge_iterator.value());
             two_merge_iterator.next()?;
         }
 
@@ -275,6 +284,27 @@ impl LsmStorageInner {
 
         // Replace with the new engine
         let new_l1_tables = self.compact_2_levels(&snapshot, &l0_sst_ids, &l1_sst_ids, true)?;
+        // Debug: dump new SSTs
+        println!("=== New L1 SSTs after compaction ===");
+        for table in &new_l1_tables {
+            println!(
+                "SST {}: first={:?}, last={:?}",
+                table.sst_id(),
+                table.first_key().key_ref(),
+                table.last_key().key_ref()
+            );
+            let mut iter = SsTableIterator::create_and_seek_to_first(table.clone()).unwrap();
+            println!("  All entries:");
+            while iter.is_valid() {
+                println!(
+                    "    key={:?}, value_empty={}",
+                    iter.key().key_ref(),
+                    iter.value().is_empty()
+                );
+                iter.next().unwrap();
+            }
+        }
+
         let state_lock = self.state_lock.lock();
         let mut new_engine = {
             let guard = self.state.read();

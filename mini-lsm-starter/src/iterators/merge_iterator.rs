@@ -113,22 +113,32 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
         }
 
         let key = self.current.as_ref().unwrap().1.key();
-        let mut wrappers_to_next: Vec<HeapWrapper<I>> = Vec::new();
 
-        while let Some(wrapper) = self.iters.peek_mut() {
+        while let Some(mut wrapper) = self.iters.peek_mut() {
+            let inner_key = wrapper.1.key();
+            println!(
+                "current_key_ref: {:?}, current_key_ts: {}, inner_key_ref: {:?}, inner_key_ts: {:?}",
+                key.key_ref(),
+                key.ts(),
+                inner_key.key_ref(),
+                inner_key.ts()
+            );
             if !wrapper.1.is_valid() {
                 PeekMut::pop(wrapper);
             } else if wrapper.1.key() == key {
-                wrappers_to_next.push(PeekMut::pop(wrapper));
+                match wrapper.1.next() {
+                    Err(e) => {
+                        PeekMut::pop(wrapper);
+                        return Err(e);
+                    }
+                    Ok(()) => {
+                        if !wrapper.1.is_valid() {
+                            PeekMut::pop(wrapper);
+                        }
+                    }
+                }
             } else {
                 break;
-            }
-        }
-
-        for mut wrapper in wrappers_to_next {
-            wrapper.1.next()?;
-            if wrapper.1.is_valid() {
-                self.iters.push(wrapper)
             }
         }
 

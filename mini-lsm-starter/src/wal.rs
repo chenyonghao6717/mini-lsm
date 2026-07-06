@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::block::{KEY_LEN_SIZE, VALUE_LEN_SIZE};
-use crate::key::KeySlice;
+use crate::key::{KeyBytes, KeySlice, TS_SIZE};
 use crate::table::CHECKSUM_SIZE;
 
 pub struct Wal {
@@ -33,7 +33,7 @@ pub struct Wal {
 }
 
 /// Wal record layout
-/// | key_len(u16) | key | value_len(u16) | value | checksum(u32) |
+/// | key_len(u16, exclude ts) | key | ts (u64) | value_len(u16) | value | checksum(u32) |
 impl Wal {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
         let file = OpenOptions::new()
@@ -46,17 +46,17 @@ impl Wal {
         })
     }
 
-    fn checksum(key: &[u8], value: &[u8]) -> u32 {
-        let mut entry =
-            Vec::<u8>::with_capacity(key.len() + KEY_LEN_SIZE + value.len() + VALUE_LEN_SIZE);
-        entry.extend_from_slice(&u16::to_le_bytes(key.len() as u16));
-        entry.extend_from_slice(key);
-        entry.extend_from_slice(&u16::to_le_bytes(value.len() as u16));
-        entry.extend_from_slice(value);
-        crc32fast::hash(&entry)
+    fn checksum(key: KeySlice, value: &[u8]) -> u32 {
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&(key.key_ref().len() as u16).to_le_bytes());
+        hasher.update(key.key_ref());
+        hasher.update(&u64::to_le_bytes(key.ts()));
+        hasher.update(&(value.len() as u16).to_le_bytes());
+        hasher.update(value);
+        hasher.finalize()
     }
 
-    fn read_next_entry(reader: &mut BufReader<File>) -> Result<Option<(Bytes, Bytes)>> {
+    fn read_next_entry(reader: &mut BufReader<File>) -> Result<Option<(KeyBytes, Bytes)>> {
         let mut key_len_buf = [0u8; KEY_LEN_SIZE];
         match reader.read_exact(&mut key_len_buf) {
             Ok(()) => {
@@ -65,6 +65,10 @@ impl Wal {
                 let mut key_buf = vec![0u8; key_len];
                 reader.read_exact(&mut key_buf)?;
                 let key = Bytes::from(key_buf);
+
+                let mut ts_buf = [0u8; TS_SIZE];
+                reader.read_exact(&mut ts_buf)?;
+                let ts = u64::from_le_bytes(ts_buf);
 
                 let mut value_len_buf = [0u8; VALUE_LEN_SIZE];
                 reader.read_exact(&mut value_len_buf)?;
@@ -78,7 +82,7 @@ impl Wal {
                 reader.read_exact(&mut raw_checksum)?;
                 let checksum = u32::from_le_bytes(raw_checksum);
 
-                let actual_checksum = Self::checksum(&key, &value);
+                let actual_checksum = Self::checksum(KeySlice::from_slice(&key, ts), &value);
                 if actual_checksum != checksum {
                     Err(anyhow!(
                         "Checksum of WAL mismatched, expected: {}, actual: {}",
@@ -86,7 +90,7 @@ impl Wal {
                         actual_checksum
                     ))
                 } else {
-                    Ok(Some((key, value)))
+                    Ok(Some((KeyBytes::from_bytes_with_ts(key, ts), value)))
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
@@ -94,7 +98,7 @@ impl Wal {
         }
     }
 
-    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<Bytes, Bytes>) -> Result<Self> {
+    pub fn recover(path: impl AsRef<Path>, skiplist: &SkipMap<KeyBytes, Bytes>) -> Result<Self> {
         let file = File::open(&path)?;
         let mut reader = BufReader::new(file);
 
@@ -112,10 +116,11 @@ impl Wal {
         })
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
         let mut writer = self.file.lock();
-        writer.write_all(&(key.len() as u16).to_le_bytes())?;
-        writer.write_all(key)?;
+        writer.write_all(&(key.key_ref().len() as u16).to_le_bytes())?;
+        writer.write_all(key.key_ref())?;
+        writer.write_all(&u64::to_le_bytes(key.ts()))?;
         writer.write_all(&(value.len() as u16).to_le_bytes())?;
         writer.write_all(value)?;
 

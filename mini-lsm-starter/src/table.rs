@@ -472,8 +472,8 @@ impl SsTable {
         self.max_ts
     }
 
-    pub fn has_overlap(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> bool {
-        match _lower {
+    pub fn has_overlap(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> bool {
+        match lower {
             Bound::Included(lower_key) => {
                 if lower_key > self.last_key.as_key_slice().key_ref() {
                     return false;
@@ -487,7 +487,7 @@ impl SsTable {
             _ => {}
         }
 
-        match _upper {
+        match upper {
             Bound::Included(upper_key) => {
                 if upper_key < self.first_key.as_key_slice().key_ref() {
                     return false;

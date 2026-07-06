@@ -100,8 +100,10 @@ impl<
                 self.b.next()?;
             }
             CompareState::Equal => {
+                while self.b.is_valid() && self.b.key() == self.a.key() {
+                    self.b.next()?;
+                }
                 self.a.next()?;
-                self.b.next()?;
             }
         }
         self.compare_state = Self::get_compare_state(&self.a, &self.b);
