@@ -19,7 +19,8 @@ use bytes::Bytes;
 
 use crate::{
     iterators::{
-        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+        StorageIterator, concat_iterator::SstConcatIterator, merge_iterator::MergeIterator,
+        two_merge_iterator::TwoMergeIterator,
     },
     mem_table::MemTableIterator,
     table::SsTableIterator,
@@ -28,26 +29,59 @@ use crate::{
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
 type LsmIteratorInner = TwoMergeIterator<
     TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>,
-    MergeIterator<MergeIterator<SsTableIterator>>,
+    MergeIterator<SstConcatIterator>,
 >;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
-    end_bound: Bound<Bytes>,
+    lower: Bound<Bytes>,
+    upper: Bound<Bytes>,
     prev_key: Vec<u8>,
+    read_ts: u64,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+    pub(crate) fn new(
+        iter: LsmIteratorInner,
+        lower: Bound<Bytes>,
+        upper: Bound<Bytes>,
+        read_ts: u64,
+    ) -> Result<Self> {
         let mut self_ = Self {
             inner: iter,
-            end_bound,
+            lower,
+            upper,
             prev_key: Vec::new(),
+            read_ts,
         };
-        if self_.is_valid() {
-            self_.prev_key = self_.inner.key().key_ref().to_vec();
-        }
+        self_.skip_until_valid()?;
         Ok(self_)
+    }
+
+    /// Seeks to the next valid key if the current key is invalid, otherwise does nothing.
+    fn skip_until_valid(&mut self) -> Result<()> {
+        if let Bound::Excluded(key) = &self.lower {
+            while self.is_valid() && self.inner.key().key_ref() == key {
+                self.inner.next()?;
+            }
+        }
+        while self.is_valid() {
+            if self.inner.key().ts() > self.read_ts {
+                self.inner.next()?;
+            } else if self.inner.key().key_ref() == self.prev_key.as_slice() {
+                self.inner.next()?;
+            } else if self.inner.value().is_empty() {
+                // All keys older than the tombstone should be skipped.
+                self.prev_key = self.inner.key().key_ref().to_vec();
+                self.inner.next()?;
+            } else {
+                break;
+            }
+        }
+        if self.is_valid() {
+            self.prev_key = self.inner.key().key_ref().to_vec();
+        }
+        Ok(())
     }
 }
 
@@ -58,10 +92,10 @@ impl StorageIterator for LsmIterator {
         if !self.inner.is_valid() {
             return false;
         }
-        match &self.end_bound {
+        match &self.upper {
             Bound::Unbounded => true,
-            Bound::Included(end_key) => self.inner.key().key_ref() <= end_key.as_ref(),
-            Bound::Excluded(end_key) => self.inner.key().key_ref() < end_key.as_ref(),
+            Bound::Included(last_key) => self.inner.key().key_ref() <= last_key.as_ref(),
+            Bound::Excluded(last_key) => self.inner.key().key_ref() < last_key.as_ref(),
         }
     }
 
@@ -75,20 +109,7 @@ impl StorageIterator for LsmIterator {
 
     fn next(&mut self) -> Result<()> {
         self.inner.next()?;
-        while self.is_valid() {
-            if self.prev_key.as_slice() == self.key() {
-                self.inner.next()?;
-            } else if self.value().is_empty() {
-                self.prev_key = self.key().to_vec();
-                self.inner.next()?;
-            } else {
-                break;
-            }
-        }
-        if self.is_valid() {
-            self.prev_key = self.key().to_vec();
-        }
-        Ok(())
+        self.skip_until_valid()
     }
 
     fn num_active_iterators(&self) -> usize {

@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use std::{
     collections::HashSet,
     ops::Bound,
@@ -44,19 +41,28 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        if let Some(entry) = self.local_storage.get(key) {
+            let value = entry.value();
+            return Ok(if value.is_empty() {
+                None
+            } else {
+                Some(value.clone())
+            });
+        }
+        self.inner.get_with_ts(self.read_ts, key)
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
-        unimplemented!()
+        self.inner.scan_with_txn(Arc::clone(self), lower, upper)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
-        unimplemented!()
+        self.local_storage
+            .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
     }
 
     pub fn delete(&self, key: &[u8]) {
-        unimplemented!()
+        self.put(key, &[]);
     }
 
     pub fn commit(&self) -> Result<()> {
@@ -83,28 +89,56 @@ pub struct TxnLocalIterator {
     item: (Bytes, Bytes),
 }
 
+impl TxnLocalIterator {
+    pub fn create(
+        map: Arc<SkipMap<Bytes, Bytes>>,
+        lower: Bound<Bytes>,
+        upper: Bound<Bytes>,
+    ) -> Result<Self> {
+        let mut self_ = TxnLocalIteratorBuilder {
+            map,
+            iter_builder: |map_ref| map_ref.range((lower, upper)),
+            item: (Bytes::new(), Bytes::new()),
+        }
+        .build();
+        self_.next()?;
+        Ok(self_)
+    }
+}
+
 impl StorageIterator for TxnLocalIterator {
     type KeyType<'a> = &'a [u8];
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.borrow_item().0.as_ref()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.borrow_item().1.as_ref()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.key().is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let next_entry = self
+            .with_iter_mut(|iter| {
+                iter.next().map(|e| {
+                    (
+                        Bytes::copy_from_slice(e.key()),
+                        Bytes::copy_from_slice(e.value()),
+                    )
+                })
+            })
+            .unwrap_or((Bytes::new(), Bytes::new()));
+        self.with_item_mut(|item| *item = next_entry);
+        Ok(())
     }
 }
 
 pub struct TxnIterator {
-    _txn: Arc<Transaction>,
+    txn: Arc<Transaction>,
     iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
 }
 
@@ -113,7 +147,7 @@ impl TxnIterator {
         txn: Arc<Transaction>,
         iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
     ) -> Result<Self> {
-        unimplemented!()
+        Ok(Self { txn, iter })
     }
 }
 
@@ -136,7 +170,7 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.iter.next()
     }
 
     fn num_active_iterators(&self) -> usize {

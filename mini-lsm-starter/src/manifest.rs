@@ -43,13 +43,13 @@ pub enum ManifestRecord {
 }
 
 impl Manifest {
-    pub fn create(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn create(path: &Path) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(path.as_ref())?;
+            .open(path)?;
 
         Ok(Manifest {
             file: Arc::new(Mutex::new(file)),

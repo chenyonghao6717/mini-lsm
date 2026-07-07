@@ -116,6 +116,16 @@ impl Wal {
         })
     }
 
+    pub fn read_max_ts(path: impl AsRef<Path>) -> Result<u64> {
+        let file = File::open(&path)?;
+        let mut reader = BufReader::new(file);
+        let mut max_ts: u64 = 0;
+        while let Some((key, _)) = Self::read_next_entry(&mut reader)? {
+            max_ts = max_ts.max(key.ts());
+        }
+        Ok(max_ts)
+    }
+
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
         let mut writer = self.file.lock();
         writer.write_all(&(key.key_ref().len() as u16).to_le_bytes())?;

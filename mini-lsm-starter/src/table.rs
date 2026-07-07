@@ -33,6 +33,7 @@ pub use iterator::SsTableIterator;
 use crate::block::Block;
 use crate::block::KEY_LEN_SIZE;
 use crate::key::TS_DEFAULT;
+use crate::key::TS_SIZE;
 use crate::key::{KeyBytes, KeySlice};
 use crate::lsm_storage::BlockCache;
 
@@ -194,12 +195,12 @@ impl FileObject {
 /// ------------------------
 /// | data | checksum(u32) |
 /// ------------------------
-/// ----------------------------------------------------------------------------------------------------------
-/// |                                                Meta Section                                            |
-/// ----------------------------------------------------------------------------------------------------------
-/// | no. of block | metadata | checksum | meta block offset | bloom filter | checksum | bloom filter offset |
-/// |     u32      |  varlen  |    u32   |        u32        |    varlen    |    u32   |        u32          |
-/// ----------------------------------------------------------------------------------------------------------
+/// ------------------------------------------------------------------------------------------------------------------|
+/// |                                                Meta Section                                            |        |
+/// ------------------------------------------------------------------------------------------------------------------|
+/// | no. of block | metadata | checksum | meta block offset | bloom filter | checksum | bloom filter offset | max_ts |
+/// |     u32      |  varlen  |    u32   |        u32        |    varlen    |    u32   |        u32          |   u64  |
+/// ------------------------------------------------------------------------------------------------------------------|
 pub struct SsTable {
     /// The actual storage unit of SsTable, the format is as above.
     pub(crate) file: FileObject,
@@ -235,6 +236,8 @@ struct SectionRange {
     bloom_checksum_end: u64,
     bloom_offset_start: u64,
     bloom_offset_end: u64,
+    max_ts_start: u64,
+    max_ts_end: u64,
 }
 
 impl SsTable {
@@ -268,8 +271,11 @@ impl SsTable {
 
         let file_size = file.size();
 
-        let bloom_offset_start = file_size - BLOOM_OFFSET_SIZE as u64;
-        let bloom_offset_end = file_size;
+        let max_ts_end = file_size;
+        let max_ts_start = file_size - TS_SIZE as u64;
+
+        let bloom_offset_end = max_ts_start;
+        let bloom_offset_start = bloom_offset_end - BLOOM_OFFSET_SIZE as u64;
 
         let bloom_offset_bytes = file.read(bloom_offset_start, BLOOM_OFFSET_SIZE as u64)?;
         let bloom_offset = Self::to_u32(&bloom_offset_bytes);
@@ -316,6 +322,8 @@ impl SsTable {
             bloom_checksum_end,
             bloom_offset_start,
             bloom_offset_end,
+            max_ts_start,
+            max_ts_end,
         }))
     }
 
@@ -347,6 +355,20 @@ impl SsTable {
         }
     }
 
+    fn read_max_ts(section_range: &SectionRange, file: &FileObject) -> Result<u64> {
+        let raw_max_ts = file.read(section_range.max_ts_start, TS_SIZE as u64)?;
+        Ok(u64::from_le_bytes([
+            raw_max_ts[0],
+            raw_max_ts[1],
+            raw_max_ts[2],
+            raw_max_ts[3],
+            raw_max_ts[4],
+            raw_max_ts[5],
+            raw_max_ts[6],
+            raw_max_ts[7],
+        ]))
+    }
+
     /// Open SSTable from a file.
     pub fn open(id: usize, block_cache: Option<Arc<BlockCache>>, file: FileObject) -> Result<Self> {
         let section_range = Self::get_section_range(&file)?;
@@ -367,6 +389,8 @@ impl SsTable {
             |x| x.last_key.clone(),
         );
 
+        let max_ts = Self::read_max_ts(&section_range, &file)?;
+
         Ok(Self {
             file,
             block_meta,
@@ -376,7 +400,7 @@ impl SsTable {
             first_key,
             last_key,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts,
         })
     }
 

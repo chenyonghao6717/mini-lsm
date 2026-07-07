@@ -146,7 +146,6 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     }
 
     fn num_active_iterators(&self) -> usize {
-        // self.current is stored separately from self.iters
-        self.iters.len() + 1
+        self.iters.len() + if self.current.is_some() { 1 } else { 0 }
     }
 }

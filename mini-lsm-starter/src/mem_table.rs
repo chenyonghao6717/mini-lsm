@@ -153,7 +153,7 @@ impl MemTable {
             |map_ref| map_ref.range((convert_bound(&lower), convert_bound(&upper))),
             to_iter_entry(None),
         );
-        // Call next() once to fill the first entry into item field.
+        // Call next() once to load the first entry into item field.
         let _ = iter.next();
         iter
     }

@@ -15,6 +15,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::cmp::max;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::ops::Bound;
@@ -33,6 +34,7 @@ use crate::compact::{
     TieredCompactionController,
 };
 use crate::iterators::StorageIterator;
+use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
@@ -40,10 +42,14 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{MemTable, MemTableIterator};
 use crate::mvcc::LsmMvccInner;
+use crate::mvcc::txn::{Transaction, TxnIterator, TxnLocalIterator};
 use crate::mvcc::watermark::Watermark;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
+use crate::wal::Wal;
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
+
+const BLOCK_CACHE_SIZE: u64 = 1024;
 
 /// Represents the state of the storage engine.
 #[derive(Clone)]
@@ -218,7 +224,7 @@ impl MiniLsm {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<Transaction>> {
         self.inner.new_txn()
     }
 
@@ -246,11 +252,7 @@ impl MiniLsm {
         self.inner.sync()
     }
 
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.inner.scan(lower, upper)
     }
 
@@ -371,18 +373,65 @@ impl LsmStorageInner {
         Ok(state)
     }
 
-    fn create_mvcc() -> Option<LsmMvccInner> {
+    fn create_mvcc(init_ts: u64) -> Option<LsmMvccInner> {
         Some(LsmMvccInner {
             write_lock: Mutex::new(()),
             commit_lock: Mutex::new(()),
-            ts: Arc::new(Mutex::new((1, Watermark::new()))),
+            ts: Arc::new(Mutex::new((init_ts + 1, Watermark::new()))),
             committed_txns: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+
+    fn create_compaction_controller(options: &LsmStorageOptions) -> CompactionController {
+        match &options.compaction_options {
+            CompactionOptions::Leveled(opts) => {
+                CompactionController::Leveled(LeveledCompactionController::new(opts.clone()))
+            }
+            CompactionOptions::Tiered(opts) => {
+                CompactionController::Tiered(TieredCompactionController::new(opts.clone()))
+            }
+            CompactionOptions::Simple(opts) => {
+                CompactionController::Simple(SimpleLeveledCompactionController::new(opts.clone()))
+            }
+            CompactionOptions::NoCompaction => CompactionController::NoCompaction,
+        }
+    }
+
+    fn get_init_ts(
+        path: &Path,
+        state: &LsmStorageState,
+        options: &LsmStorageOptions,
+        manifest_records: &[ManifestRecord],
+    ) -> u64 {
+        let max_sst_ts = state
+            .sstables
+            .iter()
+            .map(|(_, sst)| sst.max_ts())
+            .max()
+            .unwrap_or(0);
+        let max_memtable_id = manifest_records
+            .iter()
+            .filter_map(|record| match record {
+                ManifestRecord::NewMemtable(id) => {
+                    let wal_path = path.join(format!("{}.wal", id));
+                    Wal::read_max_ts(&wal_path).ok()
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        return max(max_sst_ts, max_memtable_id);
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
+        let path = path.as_ref();
+        let in_recovery = path.try_exists()?;
+
+        let compaction_controller = Self::create_compaction_controller(&options);
+        let block_cache = Arc::new(BlockCache::new(BLOCK_CACHE_SIZE));
+
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
                 CompactionController::Leveled(LeveledCompactionController::new(options.clone()))
@@ -396,46 +445,48 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
-        let block_cache = Arc::new(BlockCache::new(1024));
-        let manifest_path = path.as_ref().join("MANIFEST");
-        let in_recovery = path.as_ref().try_exists()?;
-        if in_recovery {
+        let (manifest, manifest_records, state) = if in_recovery {
+            let manifest_path = path.join("MANIFEST");
             let (manifest, manifest_records) = Manifest::recover(&manifest_path)?;
             let state = Self::load_manifest(
                 &compaction_controller,
                 &manifest_records,
                 &options,
                 Arc::clone(&block_cache),
-                path.as_ref(),
+                path,
                 &manifest_path,
             )?;
-            Ok(Self {
-                state: Arc::new(RwLock::new(Arc::new(state))),
-                state_lock: Mutex::new(()),
-                path: path.as_ref().to_path_buf(),
-                block_cache,
-                next_sst_id: AtomicUsize::new(1),
-                compaction_controller,
-                manifest: Some(manifest),
-                options: options.into(),
-                mvcc: Self::create_mvcc(),
-                compaction_filters: Arc::new(Mutex::new(Vec::new())),
-            })
+            (manifest, manifest_records, state)
         } else {
-            let state = LsmStorageState::create(&options);
-            Ok(Self {
-                state: Arc::new(RwLock::new(Arc::new(state))),
-                state_lock: Mutex::new(()),
-                path: path.as_ref().to_path_buf(),
-                block_cache,
-                next_sst_id: AtomicUsize::new(1),
-                compaction_controller,
-                manifest: Some(Manifest::create(manifest_path)?),
-                options: options.into(),
-                mvcc: Self::create_mvcc(),
-                compaction_filters: Arc::new(Mutex::new(Vec::new())),
-            })
-        }
+            let manifest = Manifest::create(&path.join("MANIFEST"))?;
+            (manifest, vec![], LsmStorageState::create(&options))
+        };
+
+        let next_sst_id = if in_recovery {
+            state.sstables.keys().max().copied().unwrap_or(0) + 1
+        } else {
+            1
+        };
+
+        let init_ts = if in_recovery {
+            Self::get_init_ts(path, &state, &options, &manifest_records)
+        } else {
+            0
+        };
+        let mvcc = Self::create_mvcc(init_ts);
+
+        Ok(Self {
+            state: Arc::new(RwLock::new(Arc::new(state))),
+            state_lock: Mutex::new(()),
+            path: path.to_path_buf(),
+            block_cache,
+            next_sst_id: AtomicUsize::new(next_sst_id),
+            compaction_controller,
+            manifest: Some(manifest),
+            options: options.into(),
+            mvcc,
+            compaction_filters: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -496,10 +547,14 @@ impl LsmStorageInner {
         Ok(value)
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+    pub fn get(self: &Arc<Self>, key: &[u8]) -> Result<Option<Bytes>> {
+        self.get_with_ts(self.mvcc().latest_commit_ts(), key)
+    }
+
+    pub fn get_with_ts(self: &Arc<Self>, read_ts: u64, key: &[u8]) -> Result<Option<Bytes>> {
         let lower = Bound::Included(key);
         let upper = Bound::Included(key);
-        let iter = self._scan(lower, upper)?;
+        let iter = self.create_lsm_iter(lower, upper, read_ts)?;
         if iter.is_valid() && iter.key() == key && !iter.value().is_empty() {
             Ok(Some(Bytes::copy_from_slice(iter.value())))
         } else {
@@ -705,9 +760,10 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
-        // no-op
-        Ok(())
+    pub fn new_txn(self: &Arc<LsmStorageInner>) -> Result<Arc<Transaction>> {
+        Ok(self
+            .mvcc()
+            .new_txn(Arc::clone(&self), self.options.serializable))
     }
 
     fn to_memtables_merge_iter(
@@ -745,9 +801,9 @@ impl LsmStorageInner {
         match lower {
             Bound::Included(key) => sst_iter.seek_to_key(key),
             Bound::Excluded(key) => {
-                let key = KeySlice::from_slice(key.key_ref(), TS_RANGE_END);
+                let key_slice = KeySlice::from_slice(key.key_ref(), TS_RANGE_END);
                 sst_iter.seek_to_key(key)?;
-                if sst_iter.is_valid() && sst_iter.key().key_ref() == key.key_ref() {
+                while sst_iter.is_valid() && sst_iter.key().key_ref() == key.key_ref() {
                     sst_iter.next()?
                 }
                 Ok(())
@@ -756,7 +812,7 @@ impl LsmStorageInner {
         }
     }
 
-    fn to_level_iter(
+    fn to_l0_merge_iter(
         level_id: usize,
         engine: &LsmStorageState,
         lower: Bound<KeySlice>,
@@ -767,13 +823,9 @@ impl LsmStorageInner {
         let is_point_lookup = Self::contain_single_key(&lower, &upper);
 
         let mut sstable_iters = Vec::<Box<SsTableIterator>>::new();
-        let sstable_ids = if level_id == 0 {
-            engine.l0_sstables.to_vec()
-        } else {
-            engine.levels[level_id - 1].1.to_vec()
-        };
+        let sst_ids = engine.l0_sstables.to_vec();
 
-        for id in sstable_ids {
+        for id in sst_ids {
             let table = Arc::clone(&engine.sstables[&id]);
             let may_contain = Self::may_contain_key(&lower, &table);
             let has_overlap =
@@ -791,55 +843,98 @@ impl LsmStorageInner {
         Ok(MergeIterator::create(sstable_iters))
     }
 
+    fn to_non_l0_concat_iter(
+        state: &LsmStorageState,
+        level_id: usize,
+        lower: Bound<KeySlice>,
+        upper: Bound<KeySlice>,
+    ) -> Result<SstConcatIterator> {
+        let level_ssts = state.levels[level_id - 1]
+            .1
+            .iter()
+            .map(|sst_id| Arc::clone(&state.sstables[sst_id]))
+            .collect::<Vec<Arc<SsTable>>>();
+        let iter = match &lower {
+            Bound::Included(key) | Bound::Excluded(key) => {
+                SstConcatIterator::create_and_seek_to_key(level_ssts, *key)?
+            }
+            /*Bound::Excluded(excluded_key) => {
+                let mut iter =
+                    SstConcatIterator::create_and_seek_to_key(level_ssts, excluded_key.clone())?;
+                while iter.is_valid() && &iter.key() <= excluded_key {
+                    iter.next();
+                }
+                iter
+            }*/
+            Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(level_ssts)?,
+        };
+        Ok(iter)
+    }
+
     fn to_non_l0_merge_iter(
         state: &LsmStorageState,
         lower: Bound<KeySlice>,
         upper: Bound<KeySlice>,
-    ) -> Result<MergeIterator<MergeIterator<SsTableIterator>>> {
-        let non_l0_sst_iters = state
-            .levels
-            .iter()
-            .map(|(id, _)| Self::to_level_iter(*id, state, lower, upper).map(Box::new))
-            .collect::<Result<Vec<Box<_>>>>()?;
-        Ok(MergeIterator::create(non_l0_sst_iters))
+    ) -> Result<MergeIterator<SstConcatIterator>> {
+        let mut concat_iters = Vec::<Box<SstConcatIterator>>::with_capacity(state.levels.len());
+        for (level_id, sst_ids) in &state.levels {
+            let concat_iter = Self::to_non_l0_concat_iter(state, *level_id, lower, upper)?;
+            concat_iters.push(Box::new(concat_iter));
+        }
+        Ok(MergeIterator::create(concat_iters))
     }
 
-    pub fn _scan(
+    /// Create an iterator without skipping tombstones and duplicate keys.
+    fn create_lsm_iter(
         &self,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
+        read_ts: u64,
     ) -> Result<FusedIterator<LsmIterator>> {
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
 
+        // Use the full range to get all versions of keys and filter them by ts in LsmIterator.
         let lower = lower.map(|key| KeySlice::from_slice(key, TS_RANGE_BEGIN));
         let upper = upper.map(|key| KeySlice::from_slice(key, TS_RANGE_END));
 
         let memtables_merge_iter = Self::to_memtables_merge_iter(&snapshot, lower, upper);
-        let l0_sst_merge_iter = Self::to_level_iter(0, &snapshot, lower, upper)?;
+        let l0_sst_merge_iter = Self::to_l0_merge_iter(0, &snapshot, lower, upper)?;
         let non_l0_sst_merge_iter = Self::to_non_l0_merge_iter(&snapshot, lower, upper)?;
 
         let memtable_and_l0_merge_iter =
             TwoMergeIterator::create(memtables_merge_iter, l0_sst_merge_iter)?;
         let iter = LsmIterator::new(
             TwoMergeIterator::create(memtable_and_l0_merge_iter, non_l0_sst_merge_iter)?,
+            lower.map(|key| Bytes::copy_from_slice(key.key_ref())),
             upper.map(|key| Bytes::copy_from_slice(key.key_ref())),
+            read_ts,
         )?;
         Ok(FusedIterator::new(iter))
     }
 
-    /// Scan need to move the cursor to the first non-tombstone key.
-    pub fn scan(
-        &self,
+    pub fn scan_with_txn(
+        self: &Arc<Self>,
+        txn: Arc<Transaction>,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
-        let mut iter = self._scan(lower, upper)?;
-        while iter.is_valid() && iter.value().is_empty() {
-            iter.next()?;
-        }
-        Ok(iter)
+    ) -> Result<TxnIterator> {
+        let lsm_iter = self.create_lsm_iter(lower, upper, txn.read_ts)?;
+        let txn_local_iter = TxnLocalIterator::create(
+            Arc::clone(&txn.local_storage),
+            lower.map(Bytes::copy_from_slice),
+            upper.map(Bytes::copy_from_slice),
+        )?;
+        let txn_and_lsm_iter = TwoMergeIterator::create(txn_local_iter, lsm_iter)?;
+        TxnIterator::create(txn, txn_and_lsm_iter)
+    }
+
+    pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        let txn = self
+            .mvcc()
+            .new_txn(Arc::clone(self), self.options.serializable);
+        Self::scan_with_txn(self, txn, lower, upper)
     }
 }
