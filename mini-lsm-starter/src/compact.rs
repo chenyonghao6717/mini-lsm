@@ -176,12 +176,22 @@ impl LsmStorageInner {
         }
     }
 
+    fn skip_tombstone_and_following_keys(
+        iter: &mut TwoMergeIterator<MergeIterator<SsTableIterator>, MergeIterator<SsTableIterator>>,
+    ) -> Result<()> {
+        let tombstone_key = iter.key().key_ref().to_vec();
+        while iter.is_valid() && iter.key().key_ref() == tombstone_key.as_slice() {
+            iter.next()?;
+        }
+        Ok(())
+    }
+
     fn compact_2_levels(
         &self,
         snapshot: &LsmStorageState,
         upper_sst_ids: &[usize],
         lower_sst_ids: &[usize],
-        _is_lower_level_bottom_level: bool,
+        is_lower_level_bottom_level: bool,
     ) -> Result<Vec<Arc<SsTable>>> {
         let mut two_merge_iterator = TwoMergeIterator::create(
             Self::get_table_merge_iter(upper_sst_ids, snapshot)?,
@@ -189,48 +199,54 @@ impl LsmStorageInner {
         )?;
         let mut new_tables = Vec::<Arc<SsTable>>::new();
         let mut cur_builder = SsTableBuilder::new(self.options.block_size);
+        let watermark = self.mvcc().watermark();
 
         let mut previous_key = Vec::<u8>::new();
+        let mut keep_key = true;
         while two_merge_iterator.is_valid() {
+            let cur_key = two_merge_iterator.key();
+            let same_key = previous_key.as_slice() == cur_key.key_ref();
+            if !same_key {
+                previous_key = cur_key.key_ref().to_vec();
+                keep_key = true;
+            }
+            if !keep_key {
+                two_merge_iterator.next()?;
+                continue;
+            }
+            // Only keep one visible version of watermark. If the latest watermark visible key
+            // is a tombstone, remove it and all older versions.
+            if cur_key.ts() <= watermark {
+                keep_key = false;
+                if is_lower_level_bottom_level && two_merge_iterator.value().is_empty() {
+                    Self::skip_tombstone_and_following_keys(&mut two_merge_iterator)?;
+                    continue;
+                }
+            }
             // Make sure all keys with the same key value are put in the same SST.
-            let same_key = previous_key.as_slice() == two_merge_iterator.key().key_ref();
             if !same_key && cur_builder.estimated_size() > self.options.target_sst_size {
-                let id = self.next_sst_id();
-                let new_table = cur_builder.build(
-                    id,
-                    Some(Arc::clone(&self.block_cache)),
-                    self.path_of_sst(id),
-                )?;
-                new_tables.push(Arc::new(new_table));
+                new_tables.push(self.finish_builder(cur_builder)?);
                 cur_builder = SsTableBuilder::new(self.options.block_size);
             }
-            let value = two_merge_iterator.value();
-
-            if !same_key {
-                previous_key = two_merge_iterator.key().key_ref().to_vec();
-            }
-
-            // Remove empty values in the lowest layer.
-            // Commented in week3 day2.
-            // if !is_lower_level_bottom_level || !value.is_empty() {
-            //     cur_builder.add(two_merge_iterator.key(), two_merge_iterator.value());
-            // }
-            cur_builder.add(two_merge_iterator.key(), two_merge_iterator.value());
+            cur_builder.add(cur_key, two_merge_iterator.value());
             two_merge_iterator.next()?;
         }
 
-        // Process the last current builder.
         if cur_builder.estimated_size() > 0 {
-            let id = self.next_sst_id();
-            let new_table = cur_builder.build(
-                id,
-                Some(Arc::clone(&self.block_cache)),
-                self.path_of_sst(id),
-            )?;
-            new_tables.push(Arc::new(new_table));
+            new_tables.push(self.finish_builder(cur_builder)?);
         }
 
         Ok(new_tables)
+    }
+
+    fn finish_builder(&self, builder: SsTableBuilder) -> Result<Arc<SsTable>> {
+        let id = self.next_sst_id();
+        let new_table = builder.build(
+            id,
+            Some(Arc::clone(&self.block_cache)),
+            self.path_of_sst(id),
+        )?;
+        Ok(Arc::new(new_table))
     }
 
     fn compact_tiered(

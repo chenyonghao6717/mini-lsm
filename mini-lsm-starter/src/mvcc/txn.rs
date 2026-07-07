@@ -71,7 +71,9 @@ impl Transaction {
 }
 
 impl Drop for Transaction {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        self.inner.mvcc().drop_read_ts(self.read_ts);
+    }
 }
 
 type SkipMapRangeIter<'a> =

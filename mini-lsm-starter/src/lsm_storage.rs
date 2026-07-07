@@ -405,22 +405,22 @@ impl LsmStorageInner {
     ) -> u64 {
         let max_sst_ts = state
             .sstables
-            .iter()
-            .map(|(_, sst)| sst.max_ts())
+            .values()
+            .map(|sst| sst.max_ts())
             .max()
             .unwrap_or(0);
         let max_memtable_id = manifest_records
             .iter()
             .filter_map(|record| match record {
                 ManifestRecord::NewMemtable(id) => {
-                    let wal_path = path.join(format!("{}.wal", id));
+                    let wal_path = Self::path_of_wal_static(path, *id);
                     Wal::read_max_ts(&wal_path).ok()
                 }
                 _ => None,
             })
             .max()
             .unwrap_or(0);
-        return max(max_sst_ts, max_memtable_id);
+        max(max_sst_ts, max_memtable_id)
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does

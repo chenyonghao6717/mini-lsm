@@ -71,6 +71,10 @@ impl LsmMvccInner {
 
     pub fn new_txn(&self, inner: Arc<LsmStorageInner>, serializable: bool) -> Arc<Transaction> {
         let read_ts = inner.mvcc().latest_commit_ts();
+        {
+            let mut ts = self.ts.lock();
+            ts.1.add_reader(read_ts);
+        }
         let transaction = Transaction {
             read_ts,
             inner,
@@ -79,5 +83,10 @@ impl LsmMvccInner {
             key_hashes: None,
         };
         Arc::new(transaction)
+    }
+
+    pub fn drop_read_ts(&self, read_ts: u64) {
+        let mut ts = self.ts.lock();
+        ts.1.remove_reader(read_ts);
     }
 }

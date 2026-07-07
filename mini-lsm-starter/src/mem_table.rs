@@ -28,6 +28,7 @@ use ouroboros::self_referencing;
 
 use crate::iterators::StorageIterator;
 use crate::key::{KeyBytes, KeySlice, TS_DEFAULT};
+use crate::lsm_storage::LsmStorageInner;
 use crate::table::SsTableBuilder;
 use crate::wal::Wal;
 
@@ -65,7 +66,7 @@ impl MemTable {
 
     /// Create a new mem-table with WAL
     pub fn create_with_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
-        let wal_path = path.as_ref().join(format!("{id}.wal", id = id));
+        let wal_path = LsmStorageInner::path_of_wal_static(path, id);
         Ok(Self {
             id,
             map: Arc::new(SkipMap::new()),
@@ -77,7 +78,7 @@ impl MemTable {
     /// Create a memtable from WAL
     pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
         let memtable = Self::create_with_wal(id, &path)?;
-        let wal_path = path.as_ref().join(format!("{id}.wal", id = id));
+        let wal_path = LsmStorageInner::path_of_wal_static(path, id);
         Wal::recover(&wal_path, &memtable.map)?;
         Ok(memtable)
     }

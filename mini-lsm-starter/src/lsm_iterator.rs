@@ -66,9 +66,9 @@ impl LsmIterator {
             }
         }
         while self.is_valid() {
-            if self.inner.key().ts() > self.read_ts {
-                self.inner.next()?;
-            } else if self.inner.key().key_ref() == self.prev_key.as_slice() {
+            let key_invisile = self.inner.key().ts() > self.read_ts;
+            let dup_key = self.inner.key().key_ref() == self.prev_key.as_slice();
+            if key_invisile || dup_key {
                 self.inner.next()?;
             } else if self.inner.value().is_empty() {
                 // All keys older than the tombstone should be skipped.
