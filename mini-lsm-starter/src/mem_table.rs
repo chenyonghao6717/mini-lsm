@@ -77,9 +77,10 @@ impl MemTable {
 
     /// Create a memtable from WAL
     pub fn recover_from_wal(id: usize, path: impl AsRef<Path>) -> Result<Self> {
-        let memtable = Self::create_with_wal(id, &path)?;
+        let mut memtable = Self::create(id);
         let wal_path = LsmStorageInner::path_of_wal_static(path, id);
-        Wal::recover(&wal_path, &memtable.map)?;
+        let wal = Wal::recover(&wal_path, &memtable.map)?;
+        memtable.wal = Some(wal);
         Ok(memtable)
     }
 
@@ -104,6 +105,10 @@ impl MemTable {
         self.scan(lower, upper)
     }
 
+    pub fn get_max_ts(&self) -> u64 {
+        self.wal.as_ref().map(|w| w.get_max_ts()).unwrap_or(0)
+    }
+
     /// Get a value by key.
     /// In week3 this function is only for testing.
     pub fn get(&self, key: KeySlice) -> Option<Bytes> {
@@ -120,24 +125,25 @@ impl MemTable {
     /// In week 2, day 6, also flush the data to WAL.
     /// In week 3, day 5, modify the function to use the batch API.
     pub fn put(&self, key: KeySlice, value: &[u8]) -> Result<()> {
-        // Week 2 implementation
-        if let Some(wal) = &self.wal {
-            wal.put(key, value)?;
-        }
-
-        let key = KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key.key_ref()), key.ts());
-        let value = Bytes::copy_from_slice(value);
-        let entry_len = key.raw_len() + value.len();
-        self.map.insert(key, value);
-        self.approximate_size
-            .fetch_add(entry_len, std::sync::atomic::Ordering::AcqRel);
-
-        Ok(())
+        self.put_batch(&[(key, value)])
     }
 
     /// Implement this in week 3, day 5; if you want to implement this earlier, use `&[u8]` as the key type.
-    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
-        unimplemented!()
+    pub fn put_batch(&self, data: &[(KeySlice, &[u8])]) -> Result<()> {
+        if let Some(wal) = &self.wal {
+            wal.put_batch(data)?;
+        }
+
+        for (key, value) in data {
+            let key = KeyBytes::from_bytes_with_ts(Bytes::copy_from_slice(key.key_ref()), key.ts());
+            let value = Bytes::copy_from_slice(value);
+            let entry_len = key.raw_len() + value.len();
+            self.map.insert(key, value);
+            self.approximate_size
+                .fetch_add(entry_len, std::sync::atomic::Ordering::AcqRel);
+        }
+
+        Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {

@@ -15,10 +15,13 @@
 use std::{
     collections::HashSet,
     ops::Bound,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
@@ -27,7 +30,7 @@ use parking_lot::Mutex;
 use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::LsmStorageInner,
+    lsm_storage::{LsmStorageInner, WriteBatchRecord},
 };
 
 pub struct Transaction {
@@ -41,6 +44,7 @@ pub struct Transaction {
 
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
+        self.check_commit_status()?;
         if let Some(entry) = self.local_storage.get(key) {
             let value = entry.value();
             return Ok(if value.is_empty() {
@@ -53,20 +57,49 @@ impl Transaction {
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
+        self.check_commit_status()?;
         self.inner.scan_with_txn(Arc::clone(self), lower, upper)
     }
 
-    pub fn put(&self, key: &[u8], value: &[u8]) {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.check_commit_status()?;
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
+        Ok(())
     }
 
-    pub fn delete(&self, key: &[u8]) {
-        self.put(key, &[]);
+    pub fn delete(&self, key: &[u8]) -> Result<()> {
+        self.check_commit_status()?;
+        self.put(key, &[])
     }
 
     pub fn commit(&self) -> Result<()> {
-        unimplemented!()
+        if self.committed.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        let mut records = Vec::<WriteBatchRecord<Bytes>>::new();
+        let local_iter = self.local_storage.iter();
+        for entry in local_iter {
+            let key = entry.key();
+            let value = entry.value();
+            records.push(if value.is_empty() {
+                WriteBatchRecord::Del(Bytes::clone(key))
+            } else {
+                WriteBatchRecord::Put(Bytes::clone(key), Bytes::clone(value))
+            })
+        }
+        self.inner.write_batch(&records)?;
+        self.committed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn check_commit_status(&self) -> Result<()> {
+        if self.committed.load(Ordering::Relaxed) {
+            Err(anyhow!("Try to process a committed transaction!"))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -111,11 +144,11 @@ impl TxnLocalIterator {
 impl StorageIterator for TxnLocalIterator {
     type KeyType<'a> = &'a [u8];
 
-    fn value(&self) -> &[u8] {
+    fn key(&self) -> &[u8] {
         self.borrow_item().0.as_ref()
     }
 
-    fn key(&self) -> &[u8] {
+    fn value(&self) -> &[u8] {
         self.borrow_item().1.as_ref()
     }
 
@@ -172,7 +205,11 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        self.iter.next()
+        self.iter.next()?;
+        while self.iter.is_valid() && self.iter.value().is_empty() {
+            self.iter.next()?;
+        }
+        Ok(())
     }
 
     fn num_active_iterators(&self) -> usize {

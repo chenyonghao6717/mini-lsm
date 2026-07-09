@@ -45,7 +45,6 @@ use crate::mvcc::LsmMvccInner;
 use crate::mvcc::txn::{Transaction, TxnIterator, TxnLocalIterator};
 use crate::mvcc::watermark::Watermark;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
-use crate::wal::Wal;
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -409,18 +408,14 @@ impl LsmStorageInner {
             .map(|sst| sst.max_ts())
             .max()
             .unwrap_or(0);
-        let max_memtable_id = manifest_records
+        let mut max_memtable_ts = state
+            .imm_memtables
             .iter()
-            .filter_map(|record| match record {
-                ManifestRecord::NewMemtable(id) => {
-                    let wal_path = Self::path_of_wal_static(path, *id);
-                    Wal::read_max_ts(&wal_path).ok()
-                }
-                _ => None,
-            })
+            .map(|memtable| memtable.get_max_ts())
             .max()
             .unwrap_or(0);
-        max(max_sst_ts, max_memtable_id)
+        max_memtable_ts = max_memtable_ts.max(state.memtable.get_max_ts());
+        max(max_sst_ts, max_memtable_ts)
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -555,6 +550,7 @@ impl LsmStorageInner {
         let lower = Bound::Included(key);
         let upper = Bound::Included(key);
         let iter = self.create_lsm_iter(lower, upper, read_ts)?;
+
         if iter.is_valid() && iter.key() == key && !iter.value().is_empty() {
             Ok(Some(Bytes::copy_from_slice(iter.value())))
         } else {
@@ -562,7 +558,8 @@ impl LsmStorageInner {
         }
     }
 
-    pub fn put_with_ts(&self, key: &[u8], value: &[u8], ts: u64) -> Result<()> {
+    /// All records of the same batch should be put into the same memtable and the same WAL.
+    pub fn put_with_ts(&self, records: Vec<(KeySlice, &[u8])>, ts: u64) -> Result<()> {
         // Only the read lock is required because only the internal state of the
         // engine is being modified, the engine itself stays the same.
         // The write lock is required only when the engine itself is replaced, that is,
@@ -572,7 +569,7 @@ impl LsmStorageInner {
         // later readers and writer from seeing a mid-state engine.
         let needs_freeze = {
             let engine = self.state.read();
-            engine.memtable.put(KeySlice::from_slice(key, ts), value)?;
+            engine.memtable.put_batch(&records)?;
             engine.memtable.approximate_size() > self.options.target_sst_size
         };
 
@@ -591,18 +588,19 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
         let _mvcc_guard = self.mvcc().write_lock.lock();
         let ts = self.mvcc().latest_commit_ts() + 1;
-        for record in batch {
-            match record {
+        let records = batch
+            .iter()
+            .map(|record| match record {
                 WriteBatchRecord::Put(key, value) => {
-                    self.put_with_ts(key.as_ref(), value.as_ref(), ts)?
+                    (KeySlice::from_slice(key.as_ref(), ts), value.as_ref())
                 }
-                WriteBatchRecord::Del(key) => self.put_with_ts(key.as_ref(), &[], ts)?,
-            }
-        }
+                WriteBatchRecord::Del(key) => (KeySlice::from_slice(key.as_ref(), ts), &[][..]),
+            })
+            .collect::<Vec<(KeySlice, &[u8])>>();
+        self.put_with_ts(records, ts)?;
         self.mvcc().update_commit_ts(ts);
         Ok(())
     }
@@ -763,7 +761,7 @@ impl LsmStorageInner {
     pub fn new_txn(self: &Arc<LsmStorageInner>) -> Result<Arc<Transaction>> {
         Ok(self
             .mvcc()
-            .new_txn(Arc::clone(&self), self.options.serializable))
+            .new_txn(Arc::clone(self), self.options.serializable))
     }
 
     fn to_memtables_merge_iter(
