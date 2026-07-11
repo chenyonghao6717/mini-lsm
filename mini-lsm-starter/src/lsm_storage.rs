@@ -588,30 +588,57 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn write_batch<T: AsRef<[u8]>>(&self, batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        let _mvcc_guard = self.mvcc().write_lock.lock();
-        let ts = self.mvcc().latest_commit_ts() + 1;
+    pub fn write_batch<T: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
+        if self.options.serializable {
+            let txn = self.new_txn()?;
+            for record in batch {
+                match record {
+                    WriteBatchRecord::Put(k, v) => txn.put(k.as_ref(), v.as_ref()),
+                    WriteBatchRecord::Del(k) => txn.put(k.as_ref(), &[]),
+                }?;
+            }
+            txn.commit()
+        } else {
+            let _write_guard = self.mvcc().write_lock.lock();
+            let commit_ts = self.mvcc().latest_commit_ts() + 1;
+            self.write_batch_inner(batch, commit_ts)?;
+            self.mvcc().update_commit_ts(commit_ts);
+            Ok(())
+        }
+    }
+
+    // This isn't thread safe so a lock must be locked before calling this.
+    pub(crate) fn write_batch_inner<T: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        batch: &[WriteBatchRecord<T>],
+        commit_ts: u64,
+    ) -> Result<()> {
         let records = batch
             .iter()
             .map(|record| match record {
-                WriteBatchRecord::Put(key, value) => {
-                    (KeySlice::from_slice(key.as_ref(), ts), value.as_ref())
+                WriteBatchRecord::Put(key, value) => (
+                    KeySlice::from_slice(key.as_ref(), commit_ts),
+                    value.as_ref(),
+                ),
+                WriteBatchRecord::Del(key) => {
+                    (KeySlice::from_slice(key.as_ref(), commit_ts), &[][..])
                 }
-                WriteBatchRecord::Del(key) => (KeySlice::from_slice(key.as_ref(), ts), &[][..]),
             })
             .collect::<Vec<(KeySlice, &[u8])>>();
-        self.put_with_ts(records, ts)?;
-        self.mvcc().update_commit_ts(ts);
+        self.put_with_ts(records, commit_ts)?;
         Ok(())
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
+    pub fn put(self: &Arc<Self>, key: &[u8], value: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Put(key, value)])
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, key: &[u8]) -> Result<()> {
+    pub fn delete(self: &Arc<Self>, key: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Del(key)])
     }
 
@@ -919,13 +946,14 @@ impl LsmStorageInner {
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> Result<TxnIterator> {
-        let lsm_iter = self.create_lsm_iter(lower, upper, txn.read_ts)?;
         let txn_local_iter = TxnLocalIterator::create(
             Arc::clone(&txn.local_storage),
             lower.map(Bytes::copy_from_slice),
             upper.map(Bytes::copy_from_slice),
         )?;
+        let lsm_iter = self.create_lsm_iter(lower, upper, txn.read_ts)?;
         let txn_and_lsm_iter = TwoMergeIterator::create(txn_local_iter, lsm_iter)?;
+        txn.add_read_key(txn_and_lsm_iter.key());
         TxnIterator::create(txn, txn_and_lsm_iter)
     }
 

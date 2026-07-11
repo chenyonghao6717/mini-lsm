@@ -25,12 +25,13 @@ use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
 use crate::{
     iterators::{StorageIterator, two_merge_iterator::TwoMergeIterator},
     lsm_iterator::{FusedIterator, LsmIterator},
     lsm_storage::{LsmStorageInner, WriteBatchRecord},
+    mvcc::CommittedTxnData,
 };
 
 pub struct Transaction {
@@ -45,6 +46,7 @@ pub struct Transaction {
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
         self.check_commit_status()?;
+        self.add_read_key(key);
         if let Some(entry) = self.local_storage.get(key) {
             let value = entry.value();
             return Ok(if value.is_empty() {
@@ -58,11 +60,13 @@ impl Transaction {
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.check_commit_status()?;
+        // self.update_key_range(lower, upper);
         self.inner.scan_with_txn(Arc::clone(self), lower, upper)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.check_commit_status()?;
+        self.add_write_key(key);
         self.local_storage
             .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
         Ok(())
@@ -73,10 +77,60 @@ impl Transaction {
         self.put(key, &[])
     }
 
+    fn remove_obselete_txns(&self) {
+        let mut committed_txns = self.inner.mvcc().committed_txns.lock();
+        let watermark = self.inner.mvcc().watermark();
+        let ts_to_remove = committed_txns
+            .keys()
+            .filter(|ts| **ts < watermark)
+            .cloned()
+            .collect::<Vec<u64>>();
+        for ts in ts_to_remove {
+            committed_txns.remove(&ts);
+        }
+    }
+
+    fn before_commit(&self, _guard: MutexGuard<()>, commit_ts: u64) -> Result<()> {
+        if self.key_hashes.is_none() {
+            return Ok(());
+        }
+        let mut committed_txns = self.inner.mvcc().committed_txns.lock();
+        let key_hashes = self.key_hashes.as_ref().unwrap().lock();
+        let read_ts = self.read_ts;
+
+        for (_, txn_data) in
+            committed_txns.range((Bound::Excluded(read_ts), Bound::Excluded(commit_ts)))
+        {
+            for read_key_hash in &key_hashes.0 {
+                if txn_data.key_hashes.contains(read_key_hash) {
+                    return Err(anyhow!(
+                        "Submitting transaction failed! Some data is modified before submitting."
+                    ));
+                }
+            }
+        }
+
+        committed_txns.insert(
+            commit_ts,
+            CommittedTxnData {
+                key_hashes: key_hashes.1.clone(),
+                commit_ts,
+                read_ts,
+            },
+        );
+
+        Ok(())
+    }
+
     pub fn commit(&self) -> Result<()> {
         if self.committed.load(Ordering::Relaxed) {
             return Ok(());
         }
+
+        let _commit_guard = self.inner.mvcc().commit_lock.lock();
+        let _write_guard = self.inner.mvcc().write_lock.lock();
+        let commit_ts = self.inner.mvcc().latest_commit_ts() + 1;
+        self.before_commit(_commit_guard, commit_ts)?;
 
         let mut records = Vec::<WriteBatchRecord<Bytes>>::new();
         let local_iter = self.local_storage.iter();
@@ -89,8 +143,10 @@ impl Transaction {
                 WriteBatchRecord::Put(Bytes::clone(key), Bytes::clone(value))
             })
         }
-        self.inner.write_batch(&records)?;
+        self.inner.write_batch_inner(&records, commit_ts)?;
         self.committed.store(true, Ordering::Relaxed);
+        self.remove_obselete_txns();
+        self.inner.mvcc().update_commit_ts(commit_ts);
         Ok(())
     }
 
@@ -99,6 +155,20 @@ impl Transaction {
             Err(anyhow!("Try to process a committed transaction!"))
         } else {
             Ok(())
+        }
+    }
+
+    pub(crate) fn add_read_key(&self, key: &[u8]) {
+        if let Some(hashes) = &self.key_hashes {
+            let mut guard = hashes.lock();
+            guard.0.insert(farmhash::hash32(key));
+        }
+    }
+
+    pub(crate) fn add_write_key(&self, key: &[u8]) {
+        if let Some(hashes) = &self.key_hashes {
+            let mut guard = hashes.lock();
+            guard.1.insert(farmhash::hash32(key));
         }
     }
 }
@@ -208,6 +278,9 @@ impl StorageIterator for TxnIterator {
         self.iter.next()?;
         while self.iter.is_valid() && self.iter.value().is_empty() {
             self.iter.next()?;
+        }
+        if self.iter.is_valid() {
+            self.txn.add_read_key(self.iter.key());
         }
         Ok(())
     }
