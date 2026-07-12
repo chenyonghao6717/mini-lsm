@@ -34,7 +34,7 @@ pub use tiered::{TieredCompactionController, TieredCompactionOptions, TieredComp
 use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
-use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::lsm_storage::{CompactionFilter, LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
@@ -176,11 +176,11 @@ impl LsmStorageInner {
         }
     }
 
-    fn skip_tombstone_and_following_keys(
+    fn skip_same_keys(
         iter: &mut TwoMergeIterator<MergeIterator<SsTableIterator>, MergeIterator<SsTableIterator>>,
     ) -> Result<()> {
-        let tombstone_key = iter.key().key_ref().to_vec();
-        while iter.is_valid() && iter.key().key_ref() == tombstone_key.as_slice() {
+        let key_ref = iter.key().key_ref().to_vec();
+        while iter.is_valid() && iter.key().key_ref() == key_ref.as_slice() {
             iter.next()?;
         }
         Ok(())
@@ -205,6 +205,7 @@ impl LsmStorageInner {
         let mut keep_key = true;
         while two_merge_iterator.is_valid() {
             let cur_key = two_merge_iterator.key();
+
             let same_key = previous_key.as_slice() == cur_key.key_ref();
             if !same_key {
                 previous_key = cur_key.key_ref().to_vec();
@@ -214,12 +215,14 @@ impl LsmStorageInner {
                 two_merge_iterator.next()?;
                 continue;
             }
-            // Only keep one visible version of watermark. If the latest watermark visible key
-            // is a tombstone, remove it and all older versions.
+            // Only keep one visible version of watermark. If the latest watermark visible key is a tombstone,
+            // or it's marked as garbage by a compaction filter,  remove it and all older versions.
             if cur_key.ts() <= watermark {
                 keep_key = false;
-                if is_lower_level_bottom_level && two_merge_iterator.value().is_empty() {
-                    Self::skip_tombstone_and_following_keys(&mut two_merge_iterator)?;
+                if is_lower_level_bottom_level && two_merge_iterator.value().is_empty()
+                    || self.match_compaction_filter(cur_key.key_ref())
+                {
+                    Self::skip_same_keys(&mut two_merge_iterator)?;
                     continue;
                 }
             }
@@ -321,7 +324,7 @@ impl LsmStorageInner {
         }
 
         // Update table ids.
-        // During merging, new l0 tables might be added, them should be kept.
+        // During merging, new l0 tables might be added so they should be kept.
         new_engine
             .l0_sstables
             .retain(|idx| !snapshot.l0_sstables.contains(idx));
@@ -528,5 +531,19 @@ impl LsmStorageInner {
             }
         });
         Ok(Some(handle))
+    }
+
+    fn match_compaction_filter(&self, key: &[u8]) -> bool {
+        let filters = self.compaction_filters.lock();
+        for filter in filters.iter() {
+            match filter {
+                CompactionFilter::Prefix(prefix) => {
+                    if key.starts_with(&prefix) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
